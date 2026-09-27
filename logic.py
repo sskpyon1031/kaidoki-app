@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,20 +25,28 @@ BUY_THRESHOLD = 75
 WATCH_THRESHOLD = 55
 
 
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+
+
 def normalize_ticker(code: str) -> str:
-    """'7203' や '285A' のような日本株コードに '.T' を付ける。"""
-    code = code.strip().upper()
+    """'7203' や '285A' のような日本株コードに '.T' を付ける。全角（７２０３）も受け付ける。"""
+    code = unicodedata.normalize("NFKC", code).strip().upper()
     if re.fullmatch(r"\d{3}[0-9A-Z]", code):
         return code + ".T"
     return code
 
 
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """欠損行と重複日付を取り除く（Yahooのデータにはたまに混ざる）。"""
+    if df.empty or not set(OHLCV) <= set(df.columns):
+        return pd.DataFrame(columns=OHLCV)
+    df = df[OHLCV].dropna(subset=["Open", "High", "Low", "Close"])
+    df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
 def fetch(ticker: str, period: str = "2y") -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
-    if df.empty:
-        return df
-    df.index = df.index.tz_localize(None).normalize()
-    return df[["Open", "High", "Low", "Close", "Volume"]]
+    return clean(yf.Ticker(ticker).history(period=period, auto_adjust=False))
 
 
 STOCK_LIST = Path(__file__).with_name("stocks_jp.csv")
@@ -81,11 +90,9 @@ def fetch_many(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame
                 df = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
             except KeyError:
                 continue
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-            if df.empty:
-                continue
-            df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
-            out[t] = df
+            df = clean(df)
+            if not df.empty:
+                out[t] = df
     return out
 
 
@@ -109,6 +116,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_market(df: pd.DataFrame, mkt: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    if mkt.empty:  # 日経平均が取れなかったときは地合い不明（地合いの点数は0点）として扱う
+        df["MktClose"] = df["MktMA25"] = df["MktChg5"] = math.nan
+        return df
+    mkt = mkt[~mkt.index.duplicated(keep="last")].sort_index()
     m = mkt["Close"].reindex(df.index, method="ffill")
     df["MktClose"] = m
     df["MktMA25"] = mkt["Close"].rolling(25).mean().reindex(df.index, method="ffill")
@@ -171,8 +182,10 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
 
     # 3. エントリータイミング (20点): 押し目 or ブレイク
     s = 0
-    near_ma = min(abs(r.Low / r.MA25 - 1), abs(r.Low / r.MA5 - 1)) <= 0.02
-    if uptrend and near_ma and r.Close > r.Open:
+    # 押し目 = 25日線付近まで下げて反発、または前日5日線を割った後に陽線で5日線を回復
+    touch_ma25 = r.Low <= r.MA25 * 1.02 and r.Close > r.MA25
+    regain_ma5 = prev.Close < prev.MA5 and r.Close > r.MA5
+    if uptrend and (touch_ma25 or regain_ma5) and r.Close > r.Open:
         s = 20
         reasons.append("上昇トレンド中の押し目（移動平均付近で反発）")
     if r.Close > r.High20 and vol_ratio >= 1.2:
@@ -221,14 +234,16 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
     if stop >= entry:
         stop = entry * 0.95
     risk_pct = (entry - stop) / entry * 100
-    target = float(max(r.High60, entry + 2 * (entry - stop)))
+    # 上に直近60日高値があればそこが利益目標（上値の壁）。高値更新中なら損切り幅の2倍を目標にする
+    target = float(r.High60) if r.High60 > entry else entry + 2 * (entry - stop)
     rr = (target - entry) / (entry - stop)
     if risk_pct > 10:
         score -= 15
         warnings.append(f"損切り幅が{risk_pct:.1f}%と大きい。入る前に損切りを決められない場所では買わない")
     if rr < 1.5:
-        score -= 10
-        warnings.append(f"リスクリワード {rr:.1f}。損失に対して利益の見込みが小さい")
+        # 利益の見込みが損失より小さい（RR<1）なら買い時にはしない
+        score -= 25 if rr < 1 else 10
+        warnings.append(f"リスクリワード {rr:.1f}。直近高値（上値の壁）が近く、損失に対して利益の見込みが小さい")
 
     score = max(0, min(100, score))
     if score >= BUY_THRESHOLD:
@@ -257,12 +272,7 @@ def position_size(capital: float, risk_pct: float, entry: float, stop: float,
     capital は円、entry/stop は現地通貨。fx は現地通貨→円のレート（日本株は1）。
     """
     per_share = (entry - stop) * fx
-    if per_share <= 0:
+    if not (math.isfinite(per_share) and per_share > 0 and entry > 0):
         return 0
     shares = min(capital * risk_pct / 100 / per_share, capital / (entry * fx))
     return int(shares // unit * unit)
-
-
-def fetch_usdjpy() -> float:
-    df = fetch("JPY=X", period="5d")
-    return float(df["Close"].iloc[-1]) if not df.empty else 150.0

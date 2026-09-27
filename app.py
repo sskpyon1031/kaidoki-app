@@ -1,4 +1,5 @@
 ﻿import hmac
+import unicodedata
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,7 +23,8 @@ def check_password() -> bool:
     if not expected or st.session_state.get("authed"):
         return True
     pw = st.text_input("パスワード", type="password")
-    if pw and hmac.compare_digest(pw, str(expected)):
+    # 日本語のパスワードでも比較できるようにバイト列で比べる
+    if pw and hmac.compare_digest(pw.encode("utf-8"), str(expected).encode("utf-8")):
         st.session_state.authed = True
         st.rerun()
     elif pw:
@@ -41,19 +43,63 @@ with st.expander("⚙️ 資金管理の設定"):
     risk_pct = st.slider("1回の許容損失（資金に対する%）", 0.5, 5.0, 1.0, 0.5)
 
 
+# 取得に失敗したときは例外を投げてキャッシュさせない（失敗結果が10分〜3時間残り続けるのを防ぐ）
+class FetchError(Exception):
+    pass
+
+
 @st.cache_data(ttl=600, show_spinner=False)
+def _load_market() -> pd.DataFrame:
+    df = logic.fetch(logic.MARKET_INDEX)
+    if df.empty:
+        raise FetchError("日経平均")
+    return df
+
+
 def load_market() -> pd.DataFrame:
-    return logic.fetch(logic.MARKET_INDEX)
+    try:
+        return _load_market()
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def _load_many(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
+    data = logic.fetch_many(list(tickers))
+    if tickers and not data:
+        raise FetchError("全銘柄の取得に失敗")
+    return data
+
+
 def load_many(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
-    return logic.fetch_many(list(tickers))
+    try:
+        return _load_many(tickers)
+    except Exception:
+        return {}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_usdjpy() -> float:
-    return logic.fetch_usdjpy()
+def _load_usdjpy() -> float:
+    df = logic.fetch("JPY=X", period="5d")
+    if df.empty:
+        raise FetchError("ドル円")
+    return float(df["Close"].iloc[-1])
+
+
+def load_usdjpy() -> float | None:
+    try:
+        return _load_usdjpy()
+    except Exception:
+        return None
+
+
+def is_intraday(last_date) -> bool:
+    """最新データが東証の取引時間中（未確定）の値かどうか。"""
+    now = pd.Timestamp.now(tz="Asia/Tokyo")
+    return pd.Timestamp(last_date).date() == now.date() and (now.hour, now.minute) < (15, 30)
+
+
+INTRADAY_NOTE = "取引時間中のため、最新の値は未確定（約20分遅れ）です。出来高が少なめに出るので、判定は15:30以降に確認するのが確実です。"
 
 
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
@@ -80,16 +126,24 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
     )
 
     is_jp = ticker.endswith(".T")
+    if is_jp and is_intraday(df.index[-1]):
+        st.warning(INTRADAY_NOTE)
+    if df["MktClose"].isna().iloc[-1]:
+        st.warning("日経平均のデータを取得できなかったため、地合いは0点として判定しています。")
     unit, fx = (100, 1.0) if is_jp else (1, load_usdjpy())
-    shares = logic.position_size(capital, risk_pct, res.entry, res.stop, unit=unit, fx=fx)
     c1, c2, c3 = st.columns(3)
     c1.metric("損切りライン", f"{res.stop:,.1f}", f"{(res.stop / res.entry - 1) * 100:.1f}%")
     c2.metric("利益目標", f"{res.target:,.1f}", f"+{(res.target / res.entry - 1) * 100:.1f}%")
-    c3.metric("推奨株数", f"{shares:,} 株", f"最大損失 約{shares * (res.entry - res.stop) * fx:,.0f}円", delta_color="off")
-    if not is_jp:
-        st.caption(f"米国株はドル建て。株数は 1ドル={fx:,.1f}円 で換算しています。")
-    if shares == 0:
-        st.warning(f"{unit}株でも許容損失を超えます。見送りか許容損失の見直しを。")
+    if fx is None:
+        c3.metric("推奨株数", "—")
+        st.warning("為替レートを取得できなかったため、推奨株数を計算できません。少し時間をおいて開き直してください。")
+    else:
+        shares = logic.position_size(capital, risk_pct, res.entry, res.stop, unit=unit, fx=fx)
+        c3.metric("推奨株数", f"{shares:,} 株", f"最大損失 約{shares * (res.entry - res.stop) * fx:,.0f}円", delta_color="off")
+        if not is_jp:
+            st.caption(f"米国株はドル建て。株数は 1ドル={fx:,.1f}円 で換算しています。")
+        if shares == 0:
+            st.warning(f"{unit}株でも許容損失を超えるか、資金が足りません。見送りか設定の見直しを。")
 
     st.markdown("##### 採点の内訳")
     for name, (s, full) in res.breakdown.items():
@@ -144,7 +198,8 @@ def label(ticker: str) -> str:
 
 def resolve(text: str) -> str:
     """候補から選んだ文字列、コード、または手入力した銘柄名をティッカーに変換する。"""
-    head = text.strip().split()[0]
+    # 全角英数字（７２０３、ＡＡＰＬ）は半角にしてから判定する
+    head = unicodedata.normalize("NFKC", text).strip().split()[0]
     if head.upper().removesuffix(".T") in NAMES or not any(ord(ch) > 127 for ch in head):
         return logic.normalize_ticker(head)
     # 候補を選ばずに日本語の名前を確定した場合は、名前の部分一致で最初の銘柄を採用する
@@ -174,16 +229,32 @@ def show_table(table: pd.DataFrame) -> None:
 
 
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
-def scan(universe: str) -> tuple[pd.DataFrame, str]:
+def _scan(universe: str) -> tuple[pd.DataFrame, str]:
     """対象銘柄をすべて採点する。重いので3時間キャッシュ（全利用者で共有）。"""
-    data = logic.fetch_many(logic.load_universe(universe), period="1y")
+    tickers = logic.load_universe(universe)
+    if load_market().empty:
+        raise FetchError("日経平均")
+    data = logic.fetch_many(tickers, period="1y")
+    # 取得できた銘柄が8割未満なら一時的な失敗とみなしてキャッシュしない
+    if len(data) < len(tickers) * 0.8:
+        raise FetchError(f"{len(data)}/{len(tickers)}銘柄しか取得できず")
     rows = [result_row(t, logic.evaluate(prepare(df))) for t, df in data.items() if len(df) >= 100]
-    as_of = max(df.index[-1] for df in data.values()).strftime("%Y-%m-%d") if data else ""
+    as_of = max(df.index[-1] for df in data.values()).strftime("%Y-%m-%d")
     return pd.DataFrame(rows), as_of
+
+
+def scan(universe: str) -> tuple[pd.DataFrame, str]:
+    try:
+        return _scan(universe)
+    except Exception:
+        return pd.DataFrame(), ""
 
 
 def market_banner() -> None:
     mkt = load_market()
+    if len(mkt) < 25:
+        st.warning("日経平均のデータを取得できませんでした（地合い不明）。")
+        return
     close, ma25 = mkt["Close"].iloc[-1], mkt["Close"].rolling(25).mean().iloc[-1]
     chg5 = (close / mkt["Close"].iloc[-6] - 1) * 100
     good = close > ma25 and chg5 > -3
@@ -210,7 +281,11 @@ with tab_rec:
         else:
             table = table.sort_values(["スコア", "RR"], ascending=False)
             buys = table[table["スコア"] >= logic.BUY_THRESHOLD]
-            st.caption(f"{as_of} 終値時点・{len(table)}銘柄を採点")
+            if is_intraday(as_of):
+                st.caption(f"{as_of} 取引時間中の値で{len(table)}銘柄を採点（最大3時間前の結果）")
+                st.warning(INTRADAY_NOTE)
+            else:
+                st.caption(f"{as_of} 終値時点・{len(table)}銘柄を採点")
             if buys.empty:
                 st.info("今は「買い時」の銘柄がありません。休むも相場です。参考としてスコア上位を表示します。")
                 shown = table.head(5)
@@ -223,6 +298,8 @@ with tab_rec:
                 df = load_many((pick,)).get(pick)
                 if df is not None and len(df) >= 100:
                     render_detail(pick, prepare(df))
+                else:
+                    st.error("この銘柄のデータを取得できませんでした。少し時間をおいて再度お試しください。")
 
 with tab_bulk:
     # 銘柄リストはURLに保存する → ブックマークすれば携帯でも次回そのまま使える
@@ -239,6 +316,8 @@ with tab_bulk:
         st.session_state.bulk_codes = new
 
     tickers = st.session_state.get("bulk_codes", saved)
+    if not tickers:
+        st.info("判定する銘柄を選んでください。")
 
     with st.spinner(f"{len(tickers)}銘柄のデータを取得中..."):
         data = load_many(tuple(tickers))
