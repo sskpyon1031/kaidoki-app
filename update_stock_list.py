@@ -27,6 +27,8 @@ def main() -> None:
         # 全角英数字を半角に（ｉＦｒｅｅ → iFree）して検索しやすくする
         "銘柄名": df["銘柄名"].map(lambda s: unicodedata.normalize("NFKC", s).strip()),
         "市場": df["市場・商品区分"].str.replace("（内国株式）", "", regex=False),
+        # TOPIX Core30 / Large70 / Mid400 がおすすめ探索の対象（TOPIX500）
+        "規模": df["規模区分"].replace("-", ""),
     })
     out.to_csv(OUT, index=False, encoding="utf-8")
     print(f"{len(out)}銘柄を {OUT.name} に保存しました")

@@ -51,6 +51,18 @@ def load_stock_names() -> dict[str, str]:
     return dict(zip(df["コード"], df["銘柄名"]))
 
 
+UNIVERSES = {
+    "TOPIX100（大型株・約100銘柄）": {"TOPIX Core30", "TOPIX Large70"},
+    "TOPIX500（大型〜中型株・約500銘柄）": {"TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"},
+}
+
+
+def load_universe(name: str) -> list[str]:
+    """おすすめ探索の対象銘柄。流動性の高い（売買が多い）銘柄に絞る。"""
+    df = pd.read_csv(STOCK_LIST, dtype=str).fillna("")
+    return [c + ".T" for c in df.loc[df["規模"].isin(UNIVERSES[name]), "コード"]]
+
+
 def parse_codes(text: str) -> list[str]:
     """カンマ・空白・改行区切りの銘柄コードを正規化して重複なく返す。"""
     codes = [normalize_ticker(c) for c in re.split(r"[\s,、，]+", text) if c.strip()]
@@ -59,21 +71,21 @@ def parse_codes(text: str) -> list[str]:
 
 def fetch_many(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
     """複数銘柄をまとめて取得する（1銘柄ずつより速く、レート制限にもかかりにくい）。"""
-    if not tickers:
-        return {}
-    raw = yf.download(tickers, period=period, auto_adjust=False, group_by="ticker",
-                      threads=True, progress=False)
     out = {}
-    for t in tickers:
-        try:
-            df = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
-        except KeyError:
-            continue
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-        if df.empty:
-            continue
-        df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
-        out[t] = df
+    for start in range(0, len(tickers), 100):  # 大量に取るときは100銘柄ずつ
+        chunk = tickers[start:start + 100]
+        raw = yf.download(chunk, period=period, auto_adjust=False, group_by="ticker",
+                          threads=True, progress=False)
+        for t in chunk:
+            try:
+                df = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+            except KeyError:
+                continue
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+            if df.empty:
+                continue
+            df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+            out[t] = df
     return out
 
 

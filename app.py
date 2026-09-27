@@ -154,7 +154,75 @@ def resolve(text: str) -> str:
     return head
 
 
-tab_bulk, tab_single = st.tabs(["📋 一括判定", "🔍 個別判定"])
+def result_row(ticker: str, res: logic.Result) -> dict:
+    return {"銘柄": label(ticker), "判定": res.verdict.split("（")[0], "スコア": res.score,
+            "終値": res.entry, "損切り": res.stop, "目標": res.target,
+            "RR": (res.target - res.entry) / (res.entry - res.stop), "_ticker": ticker}
+
+
+def show_table(table: pd.DataFrame) -> None:
+    st.dataframe(
+        table.drop(columns="_ticker"), hide_index=True, width="stretch",
+        column_config={
+            "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
+            "終値": st.column_config.NumberColumn(format="%.1f"),
+            "損切り": st.column_config.NumberColumn(format="%.1f"),
+            "目標": st.column_config.NumberColumn(format="%.1f"),
+            "RR": st.column_config.NumberColumn("RR", format="%.1f", help="リスクリワード（損失1に対する利益の見込み）"),
+        },
+    )
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def scan(universe: str) -> tuple[pd.DataFrame, str]:
+    """対象銘柄をすべて採点する。重いので3時間キャッシュ（全利用者で共有）。"""
+    data = logic.fetch_many(logic.load_universe(universe), period="1y")
+    rows = [result_row(t, logic.evaluate(prepare(df))) for t, df in data.items() if len(df) >= 100]
+    as_of = max(df.index[-1] for df in data.values()).strftime("%Y-%m-%d") if data else ""
+    return pd.DataFrame(rows), as_of
+
+
+def market_banner() -> None:
+    mkt = load_market()
+    close, ma25 = mkt["Close"].iloc[-1], mkt["Close"].rolling(25).mean().iloc[-1]
+    chg5 = (close / mkt["Close"].iloc[-6] - 1) * 100
+    good = close > ma25 and chg5 > -3
+    msg = (f"地合い：{'良好' if good else '悪化'}（日経平均 {close:,.0f}円、25日線{'より上' if close > ma25 else 'より下'}、"
+           f"5日で{chg5:+.1f}%）")
+    (st.success if good else st.warning)(msg)
+
+
+tab_rec, tab_bulk, tab_single = st.tabs(["⭐ おすすめ", "📋 一括判定", "🔍 個別判定"])
+
+with tab_rec:
+    st.markdown("流動性の高い東証の銘柄から、今のスコアが高い順に「買い時」の銘柄を探します。")
+    market_banner()
+    universe = st.selectbox("探す対象", list(logic.UNIVERSES), index=1)
+    top_n = st.segmented_control("表示件数", [10, 20, 50], default=10)
+    if st.button("おすすめを探す", type="primary", width="stretch"):
+        st.session_state.rec_universe = universe
+
+    if st.session_state.get("rec_universe") == universe:
+        with st.spinner("銘柄を採点中...（初回は1分ほどかかります。2回目以降はすぐ表示されます）"):
+            table, as_of = scan(universe)
+        if table.empty:
+            st.error("データを取得できませんでした。時間をおいて再度お試しください。")
+        else:
+            table = table.sort_values(["スコア", "RR"], ascending=False)
+            buys = table[table["スコア"] >= logic.BUY_THRESHOLD]
+            st.caption(f"{as_of} 終値時点・{len(table)}銘柄を採点")
+            if buys.empty:
+                st.info("今は「買い時」の銘柄がありません。休むも相場です。参考としてスコア上位を表示します。")
+                shown = table.head(5)
+            else:
+                st.markdown(f"**買い時 {len(buys)}銘柄**（スコアが同じ場合はリスクリワードの高い順）")
+                shown = buys.head(top_n or 10)
+            show_table(shown)
+            pick = st.selectbox("詳細を見る銘柄", shown["_ticker"].tolist(), format_func=label, key="rec_pick")
+            if pick:
+                df = load_many((pick,)).get(pick)
+                if df is not None and len(df) >= 100:
+                    render_detail(pick, prepare(df))
 
 with tab_bulk:
     # 銘柄リストはURLに保存する → ブックマークすれば携帯でも次回そのまま使える
@@ -180,30 +248,19 @@ with tab_bulk:
         df = data.get(t)
         if df is None or len(df) < 100:
             continue
-        df = prepare(df)
-        prepared[t] = df
-        r = logic.evaluate(df)
-        rows.append({"銘柄": label(t), "判定": r.verdict.split("（")[0], "スコア": r.score,
-                     "終値": r.entry, "損切り": r.stop, "目標": r.target, "_ticker": t})
+        prepared[t] = prepare(df)
+        rows.append(result_row(t, logic.evaluate(prepared[t])))
 
     missing = [t for t in tickers if t not in prepared]
     if missing:
         st.warning("取得できなかった銘柄: " + ", ".join(label(t) for t in missing))
 
     if rows:
-        table = pd.DataFrame(rows).sort_values("スコア", ascending=False)
+        table = pd.DataFrame(rows).sort_values(["スコア", "RR"], ascending=False)
         n_buy = (table["スコア"] >= logic.BUY_THRESHOLD).sum()
         st.markdown(f"**買い時 {n_buy}銘柄** / {len(table)}銘柄中")
-        st.dataframe(
-            table.drop(columns="_ticker"), hide_index=True, width="stretch",
-            column_config={
-                "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
-                "終値": st.column_config.NumberColumn(format="%.1f"),
-                "損切り": st.column_config.NumberColumn(format="%.1f"),
-                "目標": st.column_config.NumberColumn(format="%.1f"),
-            },
-        )
-        pick = st.selectbox("詳細を見る銘柄", table["_ticker"].tolist(), format_func=label)
+        show_table(table)
+        pick = st.selectbox("詳細を見る銘柄", table["_ticker"].tolist(), format_func=label, key="bulk_detail")
         if pick:
             render_detail(pick, prepared[pick], show_signals=True)
 
