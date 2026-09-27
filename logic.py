@@ -8,6 +8,7 @@
   5. 地合い（市場全体）が悪いときは無理をしない
   6. 入る前に損切りラインを決める。損切り幅が大きすぎるなら入らない
   7. 1回の損失は資金の一定割合に抑える（資金管理）
+  8. 中長期の下落相場の銘柄は、短期で反発しても買わない
 """
 from __future__ import annotations
 
@@ -144,6 +145,7 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
     r = df.iloc[i]
     prev = df.iloc[i - 1]
     ma25_5ago = df["MA25"].iloc[i - 5]
+    ma75_20ago = df["MA75"].iloc[i - 20]
     reasons: list[str] = []
     warnings: list[str] = []
     bd: dict[str, tuple[int, int]] = {}
@@ -246,6 +248,12 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
         warnings.append(f"リスクリワード {rr:.1f}。直近高値（上値の壁）が近く、損失に対して利益の見込みが小さい")
 
     score = max(0, min(100, score))
+
+    # 7. 中長期の下落相場（75日線の下で、75日線も下向き）は、短期で反発していても買い時にしない
+    if r.Close < r.MA75 and r.MA75 < ma75_20ago:
+        score = min(score, BUY_THRESHOLD - 1)
+        warnings.insert(0, "中長期の下落トレンド中（75日線の下で75日線も下向き）。短期の反発は戻り売りに注意。買い時にはしない")
+
     if score >= BUY_THRESHOLD:
         verdict = "買い時（エントリー検討）"
     elif score >= WATCH_THRESHOLD:
