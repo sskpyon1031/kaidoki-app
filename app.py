@@ -1,5 +1,8 @@
+import hashlib
 import hmac
+import importlib
 import unicodedata
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -7,6 +10,12 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import logic
+
+# Streamlit Cloud はGitHubの更新時に app.py だけ読み直し、logic.py は古いまま残ることがある。
+# 食い違うと存在しない関数を呼んで落ちるので、毎回最新の logic.py を読み込み直す。
+importlib.reload(logic)
+# キャッシュの鍵に logic.py の中身を含め、判定ルールを変えたら古い採点結果を使わないようにする
+LOGIC_VERSION = hashlib.md5(Path(logic.__file__).read_bytes()).hexdigest()
 
 MAX_TICKERS = 30
 DEFAULT_CODES = "7203, 6758, 9984, 8306, 6861"
@@ -240,7 +249,7 @@ def show_table(table: pd.DataFrame) -> None:
 
 
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
-def _scan(universe: str) -> tuple[pd.DataFrame, str]:
+def _scan(universe: str, logic_version: str) -> tuple[pd.DataFrame, str]:
     """対象銘柄をすべて採点する。重いので3時間キャッシュ（全利用者で共有）。"""
     tickers = logic.load_universe(universe)
     if load_market().empty:
@@ -256,7 +265,7 @@ def _scan(universe: str) -> tuple[pd.DataFrame, str]:
 
 def scan(universe: str) -> tuple[pd.DataFrame, str]:
     try:
-        return _scan(universe)
+        return _scan(universe, LOGIC_VERSION)
     except Exception:
         return pd.DataFrame(), ""
 
