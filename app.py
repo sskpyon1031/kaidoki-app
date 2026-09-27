@@ -73,7 +73,7 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
     color = verdict_color(res.score)
     st.markdown(
         f"<div style='padding:14px;border-radius:12px;border:2px solid {color};margin-bottom:12px'>"
-        f"<div style='font-size:13px;opacity:.7'>{ticker}　{df.index[-1]:%Y-%m-%d} 終値 {res.entry:,.1f}</div>"
+        f"<div style='font-size:13px;opacity:.7'>{label(ticker)}　{df.index[-1]:%Y-%m-%d} 終値 {res.entry:,.1f}</div>"
         f"<div style='font-size:26px;font-weight:700;color:{color}'>{res.verdict}</div>"
         f"<div style='font-size:18px'>スコア {res.score} / 100</div></div>",
         unsafe_allow_html=True,
@@ -124,21 +124,53 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
+@st.cache_data(show_spinner=False)
+def stock_names() -> dict[str, str]:
+    return logic.load_stock_names()
+
+
+NAMES = stock_names()
+OPTIONS = [f"{code} {name}" for code, name in NAMES.items()]
+OPTION_SET = set(OPTIONS)
+SEARCH_HELP = "銘柄名の一部（例: トヨタ）か4桁コードを入力して候補から選択。米国株はティッカー（例: AAPL）を入力してEnter"
+
+
+def label(ticker: str) -> str:
+    """'7203.T' → '7203 トヨタ自動車'。一覧にない銘柄はコードのみ。"""
+    code = ticker.removesuffix(".T")
+    name = NAMES.get(code) if ticker.endswith(".T") else None
+    return f"{code} {name}" if name else code
+
+
+def resolve(text: str) -> str:
+    """候補から選んだ文字列、コード、または手入力した銘柄名をティッカーに変換する。"""
+    head = text.strip().split()[0]
+    if head.upper().removesuffix(".T") in NAMES or not any(ord(ch) > 127 for ch in head):
+        return logic.normalize_ticker(head)
+    # 候補を選ばずに日本語の名前を確定した場合は、名前の部分一致で最初の銘柄を採用する
+    for code, name in NAMES.items():
+        if head in name:
+            return code + ".T"
+    return head
+
+
 tab_bulk, tab_single = st.tabs(["📋 一括判定", "🔍 個別判定"])
 
 with tab_bulk:
     # 銘柄リストはURLに保存する → ブックマークすれば携帯でも次回そのまま使える
-    saved = st.query_params.get("codes", DEFAULT_CODES)
-    text = st.text_area("銘柄コード（カンマ・スペース・改行区切り）", saved, height=90,
-                        help=f"日本株は4桁コード、米国株はティッカー。最大{MAX_TICKERS}銘柄")
+    saved = logic.parse_codes(st.query_params.get("codes", DEFAULT_CODES))[:MAX_TICKERS]
+    default = [label(t) for t in saved]
+    picked = st.multiselect(
+        "判定する銘柄", OPTIONS + [d for d in default if d not in OPTION_SET],
+        default=default, accept_new_options=True, max_selections=MAX_TICKERS,
+        placeholder="銘柄名やコードで検索", help=SEARCH_HELP + f"。最大{MAX_TICKERS}銘柄", key="bulk_pick",
+    )
     if st.button("一括判定する", type="primary", width="stretch"):
-        st.query_params["codes"] = text.strip()
-        st.session_state.bulk_codes = logic.parse_codes(text)
+        new = list(dict.fromkeys(resolve(p) for p in picked))
+        st.query_params["codes"] = ",".join(t.removesuffix(".T") for t in new)
+        st.session_state.bulk_codes = new
 
-    tickers = st.session_state.get("bulk_codes") or logic.parse_codes(saved)
-    if len(tickers) > MAX_TICKERS:
-        st.warning(f"最大{MAX_TICKERS}銘柄までです。先頭{MAX_TICKERS}銘柄を判定します。")
-        tickers = tickers[:MAX_TICKERS]
+    tickers = st.session_state.get("bulk_codes", saved)
 
     with st.spinner(f"{len(tickers)}銘柄のデータを取得中..."):
         data = load_many(tuple(tickers))
@@ -151,19 +183,19 @@ with tab_bulk:
         df = prepare(df)
         prepared[t] = df
         r = logic.evaluate(df)
-        rows.append({"銘柄": t.removesuffix(".T"), "判定": r.verdict.split("（")[0], "スコア": r.score,
-                     "終値": r.entry, "損切り": r.stop, "目標": r.target})
+        rows.append({"銘柄": label(t), "判定": r.verdict.split("（")[0], "スコア": r.score,
+                     "終値": r.entry, "損切り": r.stop, "目標": r.target, "_ticker": t})
 
     missing = [t for t in tickers if t not in prepared]
     if missing:
-        st.warning("取得できなかった銘柄: " + ", ".join(missing))
+        st.warning("取得できなかった銘柄: " + ", ".join(label(t) for t in missing))
 
     if rows:
         table = pd.DataFrame(rows).sort_values("スコア", ascending=False)
         n_buy = (table["スコア"] >= logic.BUY_THRESHOLD).sum()
         st.markdown(f"**買い時 {n_buy}銘柄** / {len(table)}銘柄中")
         st.dataframe(
-            table, hide_index=True, width="stretch",
+            table.drop(columns="_ticker"), hide_index=True, width="stretch",
             column_config={
                 "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
                 "終値": st.column_config.NumberColumn(format="%.1f"),
@@ -171,18 +203,19 @@ with tab_bulk:
                 "目標": st.column_config.NumberColumn(format="%.1f"),
             },
         )
-        pick = st.selectbox("詳細を見る銘柄", table["銘柄"].tolist())
+        pick = st.selectbox("詳細を見る銘柄", table["_ticker"].tolist(), format_func=label)
         if pick:
-            t = logic.normalize_ticker(pick)
-            render_detail(t, prepared[t], show_signals=True)
+            render_detail(pick, prepared[pick], show_signals=True)
 
 with tab_single:
-    code = st.text_input("銘柄コード", "7203", help="日本株は4桁コード（例: 7203）。米国株はティッカー（例: AAPL）")
-    if code:
-        t = logic.normalize_ticker(code)
-        with st.spinner(f"{t} のデータを取得中..."):
+    first = label("7203.T")
+    choice = st.selectbox("銘柄（名前やコードで検索）", OPTIONS, index=OPTIONS.index(first) if first in OPTION_SET else None,
+                          accept_new_options=True, placeholder="銘柄名やコードで検索", help=SEARCH_HELP)
+    if choice:
+        t = resolve(choice)
+        with st.spinner(f"{label(t)} のデータを取得中..."):
             df = load_many((t,)).get(t)
         if df is None or len(df) < 100:
-            st.error(f"{t} のデータが取得できませんでした。コードを確認してください。")
+            st.error(f"「{choice}」のデータが取得できませんでした。候補から選び直すか、コードを確認してください。")
         else:
             render_detail(t, prepare(df))

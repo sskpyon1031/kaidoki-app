@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
@@ -37,6 +38,17 @@ def fetch(ticker: str, period: str = "2y") -> pd.DataFrame:
         return df
     df.index = df.index.tz_localize(None).normalize()
     return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+STOCK_LIST = Path(__file__).with_name("stocks_jp.csv")
+
+
+def load_stock_names() -> dict[str, str]:
+    """東証の銘柄コード → 銘柄名。stocks_jp.csv は update_stock_list.py で更新する。"""
+    if not STOCK_LIST.exists():
+        return {}
+    df = pd.read_csv(STOCK_LIST, dtype=str)
+    return dict(zip(df["コード"], df["銘柄名"]))
 
 
 def parse_codes(text: str) -> list[str]:
