@@ -119,7 +119,8 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
     color = verdict_color(res.score)
     st.markdown(
         f"<div style='padding:14px;border-radius:12px;border:2px solid {color};margin-bottom:12px'>"
-        f"<div style='font-size:13px;opacity:.7'>{label(ticker)}　{df.index[-1]:%Y-%m-%d} 終値 {res.entry:,.1f}</div>"
+        f"<div style='font-size:13px;opacity:.7'>{label(ticker)}　{df.index[-1]:%Y-%m-%d} 終値 {res.entry:,.1f}"
+        f"　配当利回り {logic.dividend_yield(df):.2f}%（実績）</div>"
         f"<div style='font-size:26px;font-weight:700;color:{color}'>{res.verdict}</div>"
         f"<div style='font-size:18px'>スコア {res.score} / 100</div></div>",
         unsafe_allow_html=True,
@@ -209,9 +210,9 @@ def resolve(text: str) -> str:
     return head
 
 
-def result_row(ticker: str, res: logic.Result) -> dict:
+def result_row(ticker: str, res: logic.Result, df: pd.DataFrame) -> dict:
     return {"銘柄": label(ticker), "判定": res.verdict.split("（")[0], "スコア": res.score,
-            "終値": res.entry, "損切り": res.stop, "目標": res.target,
+            "配当(%)": logic.dividend_yield(df), "終値": res.entry, "損切り": res.stop, "目標": res.target,
             "RR": (res.target - res.entry) / (res.entry - res.stop), "_ticker": ticker}
 
 
@@ -220,7 +221,8 @@ def show_table(table: pd.DataFrame) -> None:
         table.drop(columns="_ticker"), hide_index=True, width="stretch",
         column_config={
             "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
-            "終値": st.column_config.NumberColumn(format="%.1f"),
+            "配当(%)": st.column_config.NumberColumn("配当(%)", format="%.2f", help="実績配当利回り（直近1年の配当合計÷株価）"),
+            "終値":st.column_config.NumberColumn(format="%.1f"),
             "損切り": st.column_config.NumberColumn(format="%.1f"),
             "目標": st.column_config.NumberColumn(format="%.1f"),
             "RR": st.column_config.NumberColumn("RR", format="%.1f", help="リスクリワード（損失1に対する利益の見込み）"),
@@ -238,7 +240,7 @@ def _scan(universe: str) -> tuple[pd.DataFrame, str]:
     # 取得できた銘柄が8割未満なら一時的な失敗とみなしてキャッシュしない
     if len(data) < len(tickers) * 0.8:
         raise FetchError(f"{len(data)}/{len(tickers)}銘柄しか取得できず")
-    rows = [result_row(t, logic.evaluate(prepare(df))) for t, df in data.items() if len(df) >= 100]
+    rows = [result_row(t, logic.evaluate(prepare(df)), df) for t, df in data.items() if len(df) >= 100]
     as_of = max(df.index[-1] for df in data.values()).strftime("%Y-%m-%d")
     return pd.DataFrame(rows), as_of
 
@@ -269,7 +271,11 @@ with tab_rec:
     st.markdown("流動性の高い東証の銘柄から、今のスコアが高い順に「買い時」の銘柄を探します。")
     market_banner()
     universe = st.selectbox("探す対象", list(logic.UNIVERSES), index=1)
-    top_n = st.segmented_control("表示件数", [10, 20, 50], default=10)
+    min_yield = st.select_slider("配当利回りで絞り込み", options=[0.0, 2.0, 3.0, 3.5, 4.0, 5.0], value=0.0,
+                                 format_func=lambda v: "指定なし" if v == 0 else f"{v:g}%以上")
+    c1, c2 = st.columns(2)
+    order = c1.segmented_control("並び順", ["スコア順", "配当利回り順"], default="スコア順")
+    top_n = c2.segmented_control("表示件数", [10, 20, 50], default=10)
     if st.button("おすすめを探す", type="primary", width="stretch"):
         st.session_state.rec_universe = universe
 
@@ -279,21 +285,31 @@ with tab_rec:
         if table.empty:
             st.error("データを取得できませんでした。時間をおいて再度お試しください。")
         else:
-            table = table.sort_values(["スコア", "RR"], ascending=False)
-            buys = table[table["スコア"] >= logic.BUY_THRESHOLD]
             if is_intraday(as_of):
                 st.caption(f"{as_of} 取引時間中の値で{len(table)}銘柄を採点（最大3時間前の結果）")
                 st.warning(INTRADAY_NOTE)
             else:
                 st.caption(f"{as_of} 終値時点・{len(table)}銘柄を採点")
-            if buys.empty:
-                st.info("今は「買い時」の銘柄がありません。休むも相場です。参考としてスコア上位を表示します。")
-                shown = table.head(5)
+
+            if order == "配当利回り順":
+                table = table.sort_values(["配当(%)", "スコア"], ascending=False)
             else:
-                st.markdown(f"**買い時 {len(buys)}銘柄**（スコアが同じ場合はリスクリワードの高い順）")
+                table = table.sort_values(["スコア", "RR"], ascending=False)
+            if min_yield:
+                table = table[table["配当(%)"] >= min_yield]
+            buys = table[table["スコア"] >= logic.BUY_THRESHOLD]
+            cond = f"配当利回り{min_yield:g}%以上で" if min_yield else ""
+            if buys.empty:
+                st.info(f"今は{cond}「買い時」の銘柄がありません。休むも相場です。参考として{cond}スコア上位を表示します。")
+                shown = table.sort_values(["スコア", "RR"], ascending=False).head(5)
+            else:
+                st.markdown(f"**{cond}買い時 {len(buys)}銘柄**（{order or 'スコア順'}）")
                 shown = buys.head(top_n or 10)
-            show_table(shown)
-            pick = st.selectbox("詳細を見る銘柄", shown["_ticker"].tolist(), format_func=label, key="rec_pick")
+            if not shown.empty:
+                st.caption("配当(%)は実績配当利回り（直近1年の配当合計÷株価）。予想配当や減配の予定は反映されません。")
+                show_table(shown)
+            pick = (st.selectbox("詳細を見る銘柄", shown["_ticker"].tolist(), format_func=label, key="rec_pick")
+                    if not shown.empty else None)
             if pick:
                 df = load_many((pick,)).get(pick)
                 if df is not None and len(df) >= 100:
@@ -328,7 +344,7 @@ with tab_bulk:
         if df is None or len(df) < 100:
             continue
         prepared[t] = prepare(df)
-        rows.append(result_row(t, logic.evaluate(prepared[t])))
+        rows.append(result_row(t, logic.evaluate(prepared[t]), prepared[t]))
 
     missing = [t for t in tickers if t not in prepared]
     if missing:

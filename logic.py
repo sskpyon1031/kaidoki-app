@@ -40,8 +40,15 @@ def normalize_ticker(code: str) -> str:
 def clean(df: pd.DataFrame) -> pd.DataFrame:
     """欠損行と重複日付を取り除く（Yahooのデータにはたまに混ざる）。"""
     if df.empty or not set(OHLCV) <= set(df.columns):
-        return pd.DataFrame(columns=OHLCV)
-    df = df[OHLCV].dropna(subset=["Open", "High", "Low", "Close"])
+        return pd.DataFrame(columns=OHLCV + ["Dividends"])
+    df = df.copy()
+    df["Dividends"] = df["Dividends"].fillna(0) if "Dividends" in df else 0.0
+    if "Stock Splits" in df:
+        # Yahooは株式分割と同じ日の配当だけ分割前の金額のまま（例: 日本製鉄 2025/9/29 の60円→正しくは12円）
+        split = df["Stock Splits"].fillna(0)
+        same_day = (split > 0) & (df["Dividends"] > 0)
+        df.loc[same_day, "Dividends"] = df.loc[same_day, "Dividends"] / split[same_day]
+    df = df[OHLCV + ["Dividends"]].dropna(subset=["Open", "High", "Low", "Close"])
     df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
     return df[~df.index.duplicated(keep="last")].sort_index()
 
@@ -84,7 +91,7 @@ def fetch_many(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame
     out = {}
     for start in range(0, len(tickers), 100):  # 大量に取るときは100銘柄ずつ
         chunk = tickers[start:start + 100]
-        raw = yf.download(chunk, period=period, auto_adjust=False, group_by="ticker",
+        raw = yf.download(chunk, period=period, auto_adjust=False, actions=True, group_by="ticker",
                           threads=True, progress=False)
         for t in chunk:
             try:
@@ -271,6 +278,18 @@ def score_history(df: pd.DataFrame, days: int = 250) -> pd.Series:
         idx.append(df.index[i])
         vals.append(evaluate(df, i).score)
     return pd.Series(vals, index=idx)
+
+
+def dividend_yield(df: pd.DataFrame) -> float:
+    """実績配当利回り（%）= 直近1年の1株配当の合計 ÷ 最新の株価。
+
+    予想配当ではなく過去1年の実績。減配・増配の予定や記念配当は反映されない。
+    """
+    if df.empty or "Dividends" not in df:
+        return math.nan
+    last = df.index[-1]
+    paid = df.loc[df.index > last - pd.Timedelta(days=365), "Dividends"].sum()
+    return float(paid / df["Close"].iloc[-1] * 100)
 
 
 def position_size(capital: float, risk_pct: float, entry: float, stop: float,
