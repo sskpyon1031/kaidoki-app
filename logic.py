@@ -69,8 +69,8 @@ def load_stock_names() -> dict[str, str]:
 
 
 UNIVERSES = {
-    "TOPIX100（大型株・約100銘柄）": {"TOPIX Core30", "TOPIX Large70"},
-    "TOPIX500（大型〜中型株・約500銘柄）": {"TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"},
+    "大型株（約100銘柄）": {"TOPIX Core30", "TOPIX Large70"},
+    "大型〜中型株（約500銘柄）": {"TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"},
 }
 
 
@@ -211,12 +211,12 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
         s = 15
     elif 70 < r.RSI <= 80:
         s = 6
-        warnings.append(f"RSI {r.RSI:.0f}。やや過熱")
+        warnings.append(f"買われすぎ度 {r.RSI:.0f}（100に近いほど過熱）。やや過熱")
     elif r.RSI > 80:
-        warnings.append(f"RSI {r.RSI:.0f}。過熱。飛び乗りは危険")
+        warnings.append(f"買われすぎ度 {r.RSI:.0f}（100に近いほど過熱）。過熱。飛び乗りは危険")
     else:
         s = 5
-        warnings.append(f"RSI {r.RSI:.0f}。弱い。反発を確認してから")
+        warnings.append(f"買われすぎ度 {r.RSI:.0f}と低く勢いが弱い。反発を確認してから")
     if r.Dev25 > 15:
         s = 0
         warnings.append(f"25日線から+{r.Dev25:.1f}%乖離。高値掴みに注意")
@@ -252,7 +252,7 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
     if rr < 1.5:
         # 利益の見込みが損失より小さい（RR<1）なら買い時にはしない
         score -= 25 if rr < 1 else 10
-        warnings.append(f"リスクリワード {rr:.1f}。直近高値（上値の壁）が近く、損失に対して利益の見込みが小さい")
+        warnings.append(f"損益比 {rr:.1f}（損失1に対する利益の見込み）。直近高値（上値の壁）が近く、利益の見込みが小さい")
 
     score = max(0, min(100, score))
 

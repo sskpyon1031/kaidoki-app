@@ -1,4 +1,4 @@
-﻿import hmac
+import hmac
 import unicodedata
 
 import pandas as pd
@@ -160,10 +160,15 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
 
     view = df.iloc[-120:]
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    # ローソク足のカーソル表示は英語（open/high…）になるので、日本語の説明文を自前で作る
+    hover = [f"始値 {o:,.1f}<br>高値 {h:,.1f}<br>安値 {l:,.1f}<br>終値 {c:,.1f}"
+             for o, h, l, c in zip(view.Open, view.High, view.Low, view.Close)]
     fig.add_trace(go.Candlestick(x=view.index, open=view.Open, high=view.High, low=view.Low, close=view.Close,
-                                 name="株価", increasing_line_color="#dc2626", decreasing_line_color="#2563eb"), 1, 1)
-    for ma, c in [("MA5", "#f59e0b"), ("MA25", "#10b981"), ("MA75", "#8b5cf6")]:
-        fig.add_trace(go.Scatter(x=view.index, y=view[ma], name=ma, line=dict(width=1.2, color=c)), 1, 1)
+                                 name="株価", text=hover, hoverinfo="x+text",
+                                 increasing_line_color="#dc2626", decreasing_line_color="#2563eb"), 1, 1)
+    for ma, name, c in [("MA5", "5日線", "#f59e0b"), ("MA25", "25日線", "#10b981"), ("MA75", "75日線", "#8b5cf6")]:
+        fig.add_trace(go.Scatter(x=view.index, y=view[ma], name=name, line=dict(width=1.2, color=c),
+                                 hovertemplate=f"{name} %{{y:,.1f}}<extra></extra>"), 1, 1)
     fig.add_hline(y=res.stop, line_dash="dash", line_color="#dc2626", annotation_text="損切り", row=1, col=1)
     fig.add_hline(y=res.target, line_dash="dash", line_color="#16a34a", annotation_text="目標", row=1, col=1)
     if show_signals:
@@ -171,11 +176,15 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
         sig = hist[hist >= logic.BUY_THRESHOLD]
         if not sig.empty:
             fig.add_trace(go.Scatter(x=sig.index, y=df.loc[sig.index, "Low"] * 0.98, mode="markers",
-                                     marker=dict(symbol="triangle-up", size=10, color="#16a34a"), name="買いシグナル"), 1, 1)
-    fig.add_trace(go.Bar(x=view.index, y=view.Volume, name="出来高", marker_color="#94a3b8"), 2, 1)
+                                     marker=dict(symbol="triangle-up", size=10, color="#16a34a"), name="買いシグナル",
+                                     hovertemplate="買いシグナル<extra></extra>"), 1, 1)
+    fig.add_trace(go.Bar(x=view.index, y=view.Volume, name="出来高", marker_color="#94a3b8",
+                         hovertemplate="出来高 %{y:,.0f}<extra></extra>"), 2, 1)
     fig.update_layout(height=480, xaxis_rangeslider_visible=False, margin=dict(l=4, r=4, t=30, b=4),
-                      legend=dict(orientation="h", y=1.08, font=dict(size=10)), dragmode=False)
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+                      legend=dict(orientation="h", y=1.08, font=dict(size=10)), dragmode=False,
+                      hovermode="x unified", separators=".,")
+    # 日付を「9/25」「2026/09/25」の形にする（初期設定だと Sep 25 のような英語表記になる）
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], tickformat="%-m/%-d", hoverformat="%Y/%m/%d")
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
@@ -187,7 +196,7 @@ def stock_names() -> dict[str, str]:
 NAMES = stock_names()
 OPTIONS = [f"{code} {name}" for code, name in NAMES.items()]
 OPTION_SET = set(OPTIONS)
-SEARCH_HELP = "銘柄名の一部（例: トヨタ）か4桁コードを入力して候補から選択。米国株はティッカー（例: AAPL）を入力してEnter"
+SEARCH_HELP = "銘柄名の一部（例: トヨタ）か4桁コードを入力して候補から選択。米国株はティッカー（例: AAPL）を入力して確定"
 
 
 def label(ticker: str) -> str:
@@ -213,7 +222,7 @@ def resolve(text: str) -> str:
 def result_row(ticker: str, res: logic.Result, df: pd.DataFrame) -> dict:
     return {"銘柄": label(ticker), "判定": res.verdict.split("（")[0], "スコア": res.score,
             "配当(%)": logic.dividend_yield(df), "終値": res.entry, "損切り": res.stop, "目標": res.target,
-            "RR": (res.target - res.entry) / (res.entry - res.stop), "_ticker": ticker}
+            "損益比": (res.target - res.entry) / (res.entry - res.stop), "_ticker": ticker}
 
 
 def show_table(table: pd.DataFrame) -> None:
@@ -225,7 +234,7 @@ def show_table(table: pd.DataFrame) -> None:
             "終値":st.column_config.NumberColumn(format="%.1f"),
             "損切り": st.column_config.NumberColumn(format="%.1f"),
             "目標": st.column_config.NumberColumn(format="%.1f"),
-            "RR": st.column_config.NumberColumn("RR", format="%.1f", help="リスクリワード（損失1に対する利益の見込み）"),
+            "損益比": st.column_config.NumberColumn("損益比", format="%.1f", help="損失1に対する利益の見込み（リスクリワード）。1.5以上が目安"),
         },
     )
 
@@ -294,14 +303,14 @@ with tab_rec:
             if order == "配当利回り順":
                 table = table.sort_values(["配当(%)", "スコア"], ascending=False)
             else:
-                table = table.sort_values(["スコア", "RR"], ascending=False)
+                table = table.sort_values(["スコア", "損益比"], ascending=False)
             if min_yield:
                 table = table[table["配当(%)"] >= min_yield]
             buys = table[table["スコア"] >= logic.BUY_THRESHOLD]
             cond = f"配当利回り{min_yield:g}%以上で" if min_yield else ""
             if buys.empty:
                 st.info(f"今は{cond}「買い時」の銘柄がありません。休むも相場です。参考として{cond}スコア上位を表示します。")
-                shown = table.sort_values(["スコア", "RR"], ascending=False).head(5)
+                shown = table.sort_values(["スコア", "損益比"], ascending=False).head(5)
             else:
                 st.markdown(f"**{cond}買い時 {len(buys)}銘柄**（{order or 'スコア順'}）")
                 shown = buys.head(top_n or 10)
@@ -351,7 +360,7 @@ with tab_bulk:
         st.warning("取得できなかった銘柄: " + ", ".join(label(t) for t in missing))
 
     if rows:
-        table = pd.DataFrame(rows).sort_values(["スコア", "RR"], ascending=False)
+        table = pd.DataFrame(rows).sort_values(["スコア", "損益比"], ascending=False)
         n_buy = (table["スコア"] >= logic.BUY_THRESHOLD).sum()
         st.markdown(f"**買い時 {n_buy}銘柄** / {len(table)}銘柄中")
         show_table(table)
