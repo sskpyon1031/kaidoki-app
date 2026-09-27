@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import importlib
+import json
 import unicodedata
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from streamlit_js_eval import streamlit_js_eval
 
 import logic
 
@@ -335,23 +337,76 @@ with tab_rec:
                 else:
                     st.error("この銘柄のデータを取得できませんでした。少し時間をおいて再度お試しください。")
 
-with tab_bulk:
-    # 銘柄リストはURLに保存する → ブックマークすれば携帯でも次回そのまま使える
-    saved = logic.parse_codes(st.query_params.get("codes", DEFAULT_CODES))[:MAX_TICKERS]
-    default = [label(t) for t in saved]
-    picked = st.multiselect(
-        "判定する銘柄", OPTIONS + [d for d in default if d not in OPTION_SET],
-        default=default, accept_new_options=True, max_selections=MAX_TICKERS,
-        placeholder="銘柄名やコードで検索", help=SEARCH_HELP + f"。最大{MAX_TICKERS}銘柄", key="bulk_pick",
-    )
-    if st.button("一括判定する", type="primary", width="stretch"):
-        new = list(dict.fromkeys(resolve(p) for p in picked))
-        st.query_params["codes"] = ",".join(t.removesuffix(".T") for t in new)
-        st.session_state.bulk_codes = new
+STORAGE_KEY = "kaidoki_bulk_codes"
 
-    tickers = st.session_state.get("bulk_codes", saved)
+
+def load_saved_codes() -> list[str] | None:
+    """ブラウザ（localStorage）に保存した前回の銘柄。読み込みが終わるまでは None。"""
+    raw = streamlit_js_eval(js_expressions=f"JSON.stringify({{v: localStorage.getItem('{STORAGE_KEY}')}})",
+                            key="load_bulk_codes")
+    if raw is None:
+        return None
+    value = json.loads(raw).get("v")
+    return logic.parse_codes(value) if value else []
+
+
+def save_codes(codes: list[str]) -> None:
+    """選んだ銘柄をブラウザに保存する。同じ端末・同じブラウザで次に開いたときに復元される。"""
+    text = ",".join(t.removesuffix(".T") for t in codes)
+    streamlit_js_eval(js_expressions=f"localStorage.setItem('{STORAGE_KEY}', {json.dumps(text)})",
+                      key=f"save_bulk_codes_{text}")
+
+
+def init_bulk_selection() -> bool:
+    """前回の銘柄で選択欄を初期化する。ブラウザからの読み込み待ちの間は False。
+
+    優先順位: ブラウザに保存した銘柄 → 以前の方式のURL（?codes=）→ 初期の銘柄
+    """
+    if "bulk_pick" in st.session_state:
+        return True
+    stored = load_saved_codes()
+    st.session_state.load_tries = st.session_state.get("load_tries", 0) + 1
+    if stored is None and st.session_state.load_tries < 3:
+        return False
+    codes = (stored or logic.parse_codes(st.query_params.get("codes", ""))
+             or logic.parse_codes(DEFAULT_CODES))[:MAX_TICKERS]
+    st.session_state.bulk_pick = [label(t) for t in codes]
+    st.session_state.bulk_codes = codes
+    st.session_state.saved_codes = codes
+    if "codes" in st.query_params:  # 以前の方式のURLは使わなくなったので消す
+        del st.query_params["codes"]
+    return True
+
+
+def bulk_tab() -> None:
+    # 保存・読み込み用の見えない部品が余白を取らないようにする（非表示でも動作する）
+    st.html('<style>[data-testid="stElementContainer"]:has(iframe[title*="streamlit_js_eval"])'
+            '{display:none}</style>')
+    if not init_bulk_selection():
+        st.caption("前回選んだ銘柄を読み込み中...")
+        if st.button("読み込まずに始める"):
+            st.session_state.load_tries = 99
+            st.rerun()
+        return
+
+    extra = [p for p in st.session_state.bulk_pick if p not in OPTION_SET]  # 米国株など一覧にない銘柄
+    picked = st.multiselect(
+        "判定する銘柄", OPTIONS + extra, accept_new_options=True, max_selections=MAX_TICKERS,
+        placeholder="銘柄名やコードで検索", help=SEARCH_HELP + f"。最大{MAX_TICKERS}銘柄。選んだ銘柄は次回も残ります",
+        key="bulk_pick",
+    )
+    # 選択を変えたらすぐブラウザに保存する（判定ボタンを押さずに閉じても残る）
+    current = list(dict.fromkeys(resolve(p) for p in picked))
+    if current != st.session_state.saved_codes:
+        save_codes(current)
+        st.session_state.saved_codes = current
+    if st.button("一括判定する", type="primary", width="stretch"):
+        st.session_state.bulk_codes = current
+
+    tickers = st.session_state.bulk_codes
     if not tickers:
         st.info("判定する銘柄を選んでください。")
+        return
 
     with st.spinner(f"{len(tickers)}銘柄のデータを取得中..."):
         data = load_many(tuple(tickers))
@@ -376,6 +431,10 @@ with tab_bulk:
         pick = st.selectbox("詳細を見る銘柄", table["_ticker"].tolist(), format_func=label, key="bulk_detail")
         if pick:
             render_detail(pick, prepared[pick], show_signals=True)
+
+
+with tab_bulk:
+    bulk_tab()
 
 with tab_single:
     first = label("7203.T")
