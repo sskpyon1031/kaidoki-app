@@ -160,6 +160,15 @@ def volume_profile(df: pd.DataFrame, days: int = 120, bins: int = 24) -> pd.Data
                          "出来高": vol.to_numpy()})
 
 
+def overhead_ratio(df: pd.DataFrame) -> float:
+    """直近半年の出来高のうち、現在値〜+10%の価格帯で売買された割合（%）。上値のしこりの目安。"""
+    w = df.tail(120)
+    tp = (w["High"] + w["Low"] + w["Close"]) / 3
+    close = float(df["Close"].iloc[-1])
+    total = w["Volume"].sum()
+    return float(w["Volume"][(tp > close) & (tp <= close * 1.10)].sum() / total * 100) if total else 0.0
+
+
 def supply_metrics(df: pd.DataFrame, margin: pd.DataFrame | None) -> Supply | None:
     """margin は margin.py で集めたその銘柄の信用残の履歴（日付, 売残, 買残）。"""
     if margin is None or margin.empty:
@@ -172,11 +181,8 @@ def supply_metrics(df: pd.DataFrame, margin: pd.DataFrame | None) -> Supply | No
     buy_chg = (buy / past["買残"] - 1) * 100 if chg_days and past["買残"] else math.nan
     vol20 = df["Volume"].tail(20).mean()
 
-    w = df.tail(120)
-    tp = (w["High"] + w["Low"] + w["Close"]) / 3
     close = float(df["Close"].iloc[-1])
-    zone = (tp > close) & (tp <= close * 1.10)
-    overhead = float(w["Volume"][zone].sum() / w["Volume"].sum() * 100) if w["Volume"].sum() else 0.0
+    overhead = overhead_ratio(df)
     prof = volume_profile(df)
     above = prof[(prof["下限"] + prof["上限"]) / 2 > close]
     overhead_price = float(((above["下限"] + above["上限"]) / 2)[above["出来高"].idxmax()]) if len(above) else math.nan
@@ -209,6 +215,57 @@ def supply_adjust(sup: Supply, price_chg5: float) -> tuple[int, list[str], list[
         warnings.append(f"現在値〜+10%の価格帯で直近半年の出来高の{sup.overhead:.0f}%が売買されている。"
                         f"{sup.overhead_price:,.0f}円付近に戻り売りのしこり")
     return adj, reasons, warnings
+
+
+def supply_comment(sup: Supply | None, overhead: float, adj: int) -> tuple[str, list[str]]:
+    """需給の数字を、初心者にもわかる文章にまとめる。（見出し, 説明の行）を返す。
+
+    sup が None（米国株・信用残データなし）のときは、価格帯別出来高だけで書く。
+    """
+    lines = []
+    if sup is not None:
+        if sup.buy_days >= 0.9:
+            lines.append(f"信用買い残が出来高の{sup.buy_days:.1f}日分と多めです。いずれ売られる株が多く、上値が重くなりやすい状態です。")
+        elif sup.buy_days >= 0.3:
+            lines.append(f"信用買い残は出来高の{sup.buy_days:.1f}日分で、ふつうの水準です。")
+        else:
+            lines.append(f"信用買い残は出来高の{sup.buy_days:.1f}日分と少なく、将来の売り圧力は軽い状態です。")
+
+        if math.isinf(sup.ratio):
+            lines.append("信用売り残がないため、信用倍率は計算できません。")
+        elif sup.ratio < 1:
+            lines.append(f"信用倍率は{sup.ratio:.2f}倍で、売り残の方が多い「売り長」です。株価が上がると売った人の買い戻しが入り、上昇に弾みがつきやすくなります。")
+        elif sup.ratio < 5:
+            lines.append(f"信用倍率は{sup.ratio:.1f}倍で、買いと売りのバランスは比較的とれています。")
+        elif sup.ratio < 30:
+            lines.append(f"信用倍率は{sup.ratio:.1f}倍で、やや買いに偏っています。")
+        else:
+            lines.append(f"信用倍率は{sup.ratio:.0f}倍で、大きく買いに偏っています。上がったところで利益確定の売りが出やすくなります。")
+
+        if pd.notna(sup.buy_chg):
+            if sup.buy_chg >= 10:
+                lines.append(f"信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%増えました。下がったところを信用で買う人が増えていて、さらに下がると投げ売りが出やすくなります。")
+            elif sup.buy_chg <= -5:
+                lines.append(f"信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%減りました。決済が進み、売り圧力が軽くなっています。")
+            else:
+                lines.append(f"信用買い残は{sup.chg_days}日で{sup.buy_chg:+.0f}%と、大きな変化はありません。")
+
+    if overhead >= 65:
+        lines.append(f"現在値のすぐ上（+10%まで）で、直近半年の出来高の{overhead:.0f}%が売買されています。そこで買って含み損の人が多く、株価が戻ると「やれやれ売り」が出やすい価格帯です。")
+    elif overhead <= 20:
+        lines.append(f"現在値のすぐ上（+10%まで）で売買された量は半年分の{overhead:.0f}%と少なく、上値は軽い状態です。")
+    else:
+        lines.append(f"現在値のすぐ上（+10%まで）で売買された量は半年分の{overhead:.0f}%で、ふつうの水準です。")
+
+    if sup is None:  # 信用残がないときは上値のしこりだけで判断する
+        adj = -5 if overhead >= 65 else 0
+    if adj > 0:
+        head = "需給は良好です"
+    elif adj < 0:
+        head = "需給に注意が必要です"
+    else:
+        head = "需給に大きな問題はありません"
+    return head, lines
 
 
 @dataclass
