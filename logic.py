@@ -148,6 +148,8 @@ class Supply:
     buy_days: float      # 買い残が平均出来高（20日）の何日分か
     overhead: float      # 価格帯別出来高のうち、現在値〜+10%で売買された割合（%）
     overhead_price: float  # 現在値より上で最も出来高が多い価格帯の中心
+    sell_chg: float = math.nan  # 信用売り残の増減率（%）
+    sell_days: float = math.nan  # 売り残が平均出来高（20日）の何日分か
 
 
 def volume_profile(df: pd.DataFrame, days: int = 120, bins: int = 24) -> pd.DataFrame:
@@ -186,8 +188,47 @@ def supply_metrics(df: pd.DataFrame, margin: pd.DataFrame | None) -> Supply | No
     prof = volume_profile(df)
     above = prof[(prof["下限"] + prof["上限"]) / 2 > close]
     overhead_price = float(((above["下限"] + above["上限"]) / 2)[above["出来高"].idxmax()]) if len(above) else math.nan
+    sell_chg = (sell / past["売残"] - 1) * 100 if chg_days and past["売残"] else math.nan
     return Supply(str(now["日付"]), buy, sell, buy_chg, chg_days,
-                  buy / sell if sell else math.inf, buy / vol20 if vol20 else math.nan, overhead, overhead_price)
+                  buy / sell if sell else math.inf, buy / vol20 if vol20 else math.nan, overhead, overhead_price,
+                  sell_chg, sell / vol20 if vol20 else math.nan)
+
+
+SQUEEZE_STRONG = "🔥 踏み上げ注目"
+SQUEEZE_WATCH = "👀 売り残多め"
+
+
+def short_squeeze(sup: Supply | None, df: pd.DataFrame) -> tuple[str, str] | None:
+    """信用売り残が多く、買い戻し（踏み上げ）で反発しやすい状態かを判定する。
+
+    しきい値は TOPIX500 の分布（2026/10/1時点）から決めた:
+      売り残が多い = 信用倍率1倍未満（約8%の銘柄） または 売り残が出来高の0.3日分以上（上位5%）
+      踏み上げ注目 = 売り残が多い ＋ 株価が上がり始めた（前日より上昇し、5日線の上）
+    返り値は（区分, 説明文）。当てはまらなければ None。
+    """
+    if sup is None:
+        return None
+    long_short = sup.ratio < 1
+    thick = pd.notna(sup.sell_days) and sup.sell_days >= 0.3
+    if not (long_short or thick):
+        return None
+    facts = []
+    if long_short:
+        facts.append(f"信用倍率{sup.ratio:.2f}倍で売り残の方が多い")
+    if thick:
+        facts.append(f"売り残が出来高の{sup.sell_days:.1f}日分")
+    if pd.notna(sup.sell_chg) and sup.sell_chg >= 10:
+        facts.append(f"売り残が{sup.chg_days}日で{sup.sell_chg:+.0f}%増加")
+    fact = "・".join(facts)
+
+    r = df.iloc[-1]
+    ma5 = df["Close"].tail(5).mean()
+    rising = r["Close"] > df["Close"].iloc[-2] and r["Close"] > ma5
+    if rising:
+        return SQUEEZE_STRONG, (f"{fact}。株価が上がり始めており、売った人が損失を避けるために買い戻すと、"
+                                "反発に弾みがつきやすい状態です。")
+    return SQUEEZE_WATCH, (f"{fact}。株価が上がり始めると買い戻しが入りやすい状態です。"
+                           "前日より上昇して5日線を超えたら「踏み上げ注目」になります。")
 
 
 def supply_adjust(sup: Supply, price_chg5: float) -> tuple[int, list[str], list[str]]:
@@ -280,6 +321,7 @@ class Result:
     target: float = math.nan
     supply: Supply | None = None
     supply_adj: int = 0  # 需給による加点・減点
+    squeeze: tuple[str, str] | None = None  # 売り残が多く反発しやすいときのお知らせ（区分, 説明文）
 
 
 def evaluate(df: pd.DataFrame, i: int = -1, margin: pd.DataFrame | None = None) -> Result:
@@ -414,7 +456,8 @@ def evaluate(df: pd.DataFrame, i: int = -1, margin: pd.DataFrame | None = None) 
         verdict = "様子見（条件が揃うのを待つ）"
     else:
         verdict = "見送り"
-    return Result(score, verdict, bd, reasons, warnings, entry, stop, target, sup, adj)
+    squeeze = short_squeeze(sup, df.iloc[: len(df) + i + 1]) if sup is not None else None
+    return Result(score, verdict, bd, reasons, warnings, entry, stop, target, sup, adj, squeeze)
 
 
 def score_history(df: pd.DataFrame, days: int = 250) -> pd.Series:

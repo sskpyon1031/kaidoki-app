@@ -110,9 +110,11 @@ MARGIN_FILE = Path(__file__).with_name("data") / "margin_history.csv"
 MARGIN_VERSION = str(MARGIN_FILE.stat().st_mtime) if MARGIN_FILE.exists() else ""
 
 
-@st.cache_data(show_spinner=False)
+# cache_data は呼ぶたびに中身を丸ごとコピーして返すため、約4,200銘柄分の表を
+# おすすめの採点（約500回呼ぶ）で使うと非常に遅くなる。コピーしない cache_resource を使う（読み取り専用）
+@st.cache_resource(show_spinner=False)
 def margin_table(version: str) -> dict[str, pd.DataFrame]:
-    """銘柄コード → 信用残の履歴（日付, 売残, 買残）。"""
+    """銘柄コード → 信用残の履歴（日付, 売残, 買残）。中身は書き換えないこと。"""
     if not MARGIN_FILE.exists():
         return {}
     df = pd.read_csv(MARGIN_FILE, dtype={"コード": str})
@@ -184,6 +186,13 @@ SUPPLY_GUIDE = """
 | 株価が下がる中で買い残が10%以上増えた | −5点 |
 | 現在値〜+10%に半年分の出来高の65%以上が集中 | −5点 |
 | 信用倍率1倍未満（売り長） | +5点 |
+
+**売り残が多いときのお知らせ**
+信用売り残が多い銘柄は、株価が上がり始めると、売った人が損失を避けるために買い戻し、上昇に弾みがつくことがあります（踏み上げ）。このアプリでは次の2段階でお知らせします。
+- 👀 売り残多め：信用倍率が1倍未満、または売り残が出来高の0.3日分以上（大型〜中型株の上位5%）
+- 🔥 踏み上げ注目：上の条件に加えて、株価が上がり始めた（前日より上昇し、5日線の上）
+
+お知らせは「買い時」の判定とは別です。売り残が多いのは「この先下がる」と考える人が多いということでもあるので、下落トレンドの銘柄では反発が続かないこともあります。
 
 **注意**
 信用残は日本取引所グループの公表データで、株価より1営業日遅れます。需給だけで売買を決めず、トレンドや地合い、損切りラインとあわせて判断してください。
@@ -264,6 +273,9 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
         f"<div style='font-size:18px'>スコア {res.score} / 100</div></div>",
         unsafe_allow_html=True,
     )
+    if res.squeeze:
+        kind, msg = res.squeeze
+        (st.error if kind == logic.SQUEEZE_STRONG else st.warning)(f"**{kind}**　{msg}")
 
     is_jp = ticker.endswith(".T")
     if is_jp and is_intraday(df.index[-1]):
@@ -366,12 +378,18 @@ def result_row(ticker: str, res: logic.Result, df: pd.DataFrame) -> dict:
             "配当(%)": logic.dividend_yield(df), "終値": res.entry, "損切り": res.stop, "目標": res.target,
             "損益比": (res.target - res.entry) / (res.entry - res.stop),
             "信用倍率": res.supply.ratio if res.supply and math.isfinite(res.supply.ratio) else math.nan,
-            "買残(日)": res.supply.buy_days if res.supply else math.nan, "_ticker": ticker}
+            "買残(日)": res.supply.buy_days if res.supply else math.nan,
+            "お知らせ": res.squeeze[0] if res.squeeze else "",
+            "_売残日数": res.supply.sell_days if res.supply else math.nan,
+            "_お知らせ文": res.squeeze[1] if res.squeeze else "", "_ticker": ticker}
 
 
 def show_table(table: pd.DataFrame) -> None:
+    hidden = [c for c in table.columns if c.startswith("_")]  # 並べ替えや詳細表示用の列は表に出さない
+    if not (table["お知らせ"] != "").any():
+        hidden.append("お知らせ")
     st.dataframe(
-        table.drop(columns="_ticker"), hide_index=True, width="stretch",
+        table.drop(columns=hidden), hide_index=True, width="stretch",
         column_config={
             "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
             "配当(%)": st.column_config.NumberColumn("配当(%)", format="%.2f", help="実績配当利回り（直近1年の配当合計÷株価）"),
@@ -383,6 +401,22 @@ def show_table(table: pd.DataFrame) -> None:
             "買残(日)": st.column_config.NumberColumn("買残(日)", format="%.1f", help="信用買い残が平均出来高の何日分か"),
         },
     )
+
+
+def squeeze_list(table: pd.DataFrame) -> pd.DataFrame:
+    """お知らせ（踏み上げ注目・売り残多め）がある銘柄。踏み上げ注目を先に、売り残の多い順に並べる。"""
+    sq = table[table["お知らせ"] != ""].copy()
+    sq["_順"] = (sq["お知らせ"] != logic.SQUEEZE_STRONG).astype(int)
+    return sq.sort_values(["_順", "_売残日数"], ascending=[True, False]).drop(columns="_順")
+
+
+def show_squeeze_table(sq: pd.DataFrame) -> None:
+    view = sq[["銘柄", "お知らせ", "判定", "スコア", "信用倍率", "_売残日数"]].rename(columns={"_売残日数": "売残(日)"})
+    st.dataframe(view, hide_index=True, width="stretch", column_config={
+        "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
+        "信用倍率": st.column_config.NumberColumn(format="%.2f", help="信用買い残÷信用売り残。1倍未満は売り残の方が多い"),
+        "売残(日)": st.column_config.NumberColumn(format="%.2f", help="信用売り残が平均出来高の何日分か"),
+    })
 
 
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
@@ -451,6 +485,7 @@ with tab_rec:
                 table = table.sort_values(["配当(%)", "スコア"], ascending=False)
             else:
                 table = table.sort_values(["スコア", "損益比"], ascending=False)
+            all_table = table
             if min_yield:
                 table = table[table["配当(%)"] >= min_yield]
             buys = table[table["スコア"] >= logic.BUY_THRESHOLD]
@@ -464,8 +499,18 @@ with tab_rec:
             if not shown.empty:
                 st.caption("配当(%)は実績配当利回り（直近1年の配当合計÷株価）。予想配当や減配の予定は反映されません。")
                 show_table(shown)
-            pick = (st.selectbox("詳細を見る銘柄", shown["_ticker"].tolist(), format_func=label, key="rec_pick")
-                    if not shown.empty else None)
+
+            # 売り残が多く反発しやすい銘柄（買い時かどうかに関係なくお知らせする）
+            sq = squeeze_list(all_table)
+            if not sq.empty:
+                n_strong = (sq["お知らせ"] == logic.SQUEEZE_STRONG).sum()
+                st.markdown(f"##### 🔥 売り残が多く、反発しやすい銘柄（{len(sq)}銘柄・うち踏み上げ注目 {n_strong}）")
+                st.caption("「買い時」の判定とは別のお知らせです。下落トレンド中の銘柄も含みます。")
+                show_squeeze_table(sq)
+
+            options = list(dict.fromkeys(shown["_ticker"].tolist() + sq["_ticker"].tolist()))
+            pick = (st.selectbox("詳細を見る銘柄", options, format_func=label, key="rec_pick")
+                    if options else None)
             if pick:
                 df = load_many((pick,)).get(pick)
                 if df is not None and len(df) >= 100:
@@ -563,6 +608,9 @@ def bulk_tab() -> None:
         table = pd.DataFrame(rows).sort_values(["スコア", "損益比"], ascending=False)
         n_buy = (table["スコア"] >= logic.BUY_THRESHOLD).sum()
         st.markdown(f"**買い時 {n_buy}銘柄** / {len(table)}銘柄中")
+        for _, row in squeeze_list(table).iterrows():
+            box = st.error if row["お知らせ"] == logic.SQUEEZE_STRONG else st.warning
+            box(f"**{row['お知らせ']}：{row['銘柄']}**　{row['_お知らせ文']}")
         show_table(table)
         pick = st.selectbox("詳細を見る銘柄", table["_ticker"].tolist(), format_func=label, key="bulk_detail")
         if pick:
