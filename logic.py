@@ -9,6 +9,7 @@
   6. 入る前に損切りラインを決める。損切り幅が大きすぎるなら入らない
   7. 1回の損失は資金の一定割合に抑える（資金管理）
   8. 中長期の下落相場の銘柄は、短期で反発しても買わない
+  9. 信用買い残が多い（将来の売り圧力）・上値にしこりがある銘柄は割り引いて考える
 """
 from __future__ import annotations
 
@@ -136,6 +137,81 @@ def add_market(df: pd.DataFrame, mkt: pd.DataFrame) -> pd.DataFrame:
 
 
 @dataclass
+class Supply:
+    """信用残などの需給の情報（日本株のみ）。"""
+    date: str            # 信用残の基準日
+    buy: int             # 信用買い残（株）
+    sell: int            # 信用売り残（株）
+    buy_chg: float       # 信用買い残の増減率（%）。比較できる過去データがなければ nan
+    chg_days: int        # buy_chg が何営業日前との比較か
+    ratio: float         # 信用倍率 = 買い残 ÷ 売り残
+    buy_days: float      # 買い残が平均出来高（20日）の何日分か
+    overhead: float      # 価格帯別出来高のうち、現在値〜+10%で売買された割合（%）
+    overhead_price: float  # 現在値より上で最も出来高が多い価格帯の中心
+
+
+def volume_profile(df: pd.DataFrame, days: int = 120, bins: int = 24) -> pd.DataFrame:
+    """価格帯別出来高。各日の出来高をその日の平均的な価格（高値・安値・終値の平均）に割り当てる。"""
+    w = df.tail(days)
+    tp = (w["High"] + w["Low"] + w["Close"]) / 3
+    edges = pd.interval_range(float(w["Low"].min()), float(w["High"].max()) * 1.0001, periods=bins)
+    vol = w["Volume"].groupby(pd.cut(tp, edges), observed=False).sum()
+    return pd.DataFrame({"下限": [iv.left for iv in vol.index], "上限": [iv.right for iv in vol.index],
+                         "出来高": vol.to_numpy()})
+
+
+def supply_metrics(df: pd.DataFrame, margin: pd.DataFrame | None) -> Supply | None:
+    """margin は margin.py で集めたその銘柄の信用残の履歴（日付, 売残, 買残）。"""
+    if margin is None or margin.empty:
+        return None
+    m = margin.sort_values("日付")
+    now = m.iloc[-1]
+    past = m.iloc[max(0, len(m) - 6)]  # 5営業日前（なければ一番古い日）
+    chg_days = len(m) - 1 - max(0, len(m) - 6)
+    buy, sell = int(now["買残"]), int(now["売残"])
+    buy_chg = (buy / past["買残"] - 1) * 100 if chg_days and past["買残"] else math.nan
+    vol20 = df["Volume"].tail(20).mean()
+
+    w = df.tail(120)
+    tp = (w["High"] + w["Low"] + w["Close"]) / 3
+    close = float(df["Close"].iloc[-1])
+    zone = (tp > close) & (tp <= close * 1.10)
+    overhead = float(w["Volume"][zone].sum() / w["Volume"].sum() * 100) if w["Volume"].sum() else 0.0
+    prof = volume_profile(df)
+    above = prof[(prof["下限"] + prof["上限"]) / 2 > close]
+    overhead_price = float(((above["下限"] + above["上限"]) / 2)[above["出来高"].idxmax()]) if len(above) else math.nan
+    return Supply(str(now["日付"]), buy, sell, buy_chg, chg_days,
+                  buy / sell if sell else math.inf, buy / vol20 if vol20 else math.nan, overhead, overhead_price)
+
+
+def supply_adjust(sup: Supply, price_chg5: float) -> tuple[int, list[str], list[str]]:
+    """需給による加点・減点。しきい値は TOPIX500 の分布（2026/10/1時点）から決めた。"""
+    adj, reasons, warnings = 0, [], []
+    if sup.buy_days >= 1.5:
+        adj -= 10
+        warnings.append(f"信用買い残が出来高の{sup.buy_days:.1f}日分と多い。将来の売り圧力（しこり）が大きい")
+    elif sup.buy_days >= 0.9:
+        adj -= 5
+        warnings.append(f"信用買い残が出来高の{sup.buy_days:.1f}日分とやや多い")
+    if sup.ratio >= 30 and sup.buy_days >= 0.5:
+        adj -= 5
+        warnings.append(f"信用倍率{sup.ratio:.0f}倍と買いに偏っている。上がると利益確定の売りが出やすい")
+    elif sup.ratio < 1:
+        adj += 5
+        reasons.append(f"信用倍率{sup.ratio:.2f}倍で売り残の方が多い。買い戻し（踏み上げ）が入りやすい")
+    if pd.notna(sup.buy_chg) and sup.buy_chg >= 10 and price_chg5 < 0:
+        adj -= 5
+        warnings.append(f"株価が下がる中で信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%増加。投げ売りの予備軍に注意")
+    elif pd.notna(sup.buy_chg) and sup.buy_chg <= -5 and price_chg5 > 0:
+        reasons.append(f"信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%減りながら上昇（売り圧力が軽くなっている）")
+    if sup.overhead >= 65:
+        adj -= 5
+        warnings.append(f"現在値〜+10%の価格帯で直近半年の出来高の{sup.overhead:.0f}%が売買されている。"
+                        f"{sup.overhead_price:,.0f}円付近に戻り売りのしこり")
+    return adj, reasons, warnings
+
+
+@dataclass
 class Result:
     score: int
     verdict: str
@@ -145,10 +221,15 @@ class Result:
     entry: float = math.nan
     stop: float = math.nan
     target: float = math.nan
+    supply: Supply | None = None
+    supply_adj: int = 0  # 需給による加点・減点
 
 
-def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
-    """df（指標・地合い付き）の i 行目時点で買い時を判定する。"""
+def evaluate(df: pd.DataFrame, i: int = -1, margin: pd.DataFrame | None = None) -> Result:
+    """df（指標・地合い付き）の i 行目時点で買い時を判定する。
+
+    margin（信用残の履歴）を渡すと需給も判定に反映する。信用残は最新分しかないので i=-1 のときだけ使う。
+    """
     r = df.iloc[i]
     prev = df.iloc[i - 1]
     ma25_5ago = df["MA25"].iloc[i - 5]
@@ -254,9 +335,18 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
         score -= 25 if rr < 1 else 10
         warnings.append(f"損益比 {rr:.1f}（損失1に対する利益の見込み）。直近高値（上値の壁）が近く、利益の見込みが小さい")
 
+    # 7. 需給（信用残・価格帯別出来高）
+    sup = supply_metrics(df.iloc[: len(df) + i + 1], margin) if i == -1 else None
+    adj = 0
+    if sup is not None:
+        adj, sup_reasons, sup_warnings = supply_adjust(sup, (r.Close / df["Close"].iloc[i - 5] - 1) * 100)
+        score += adj
+        reasons += sup_reasons
+        warnings += sup_warnings
+
     score = max(0, min(100, score))
 
-    # 7. 中長期の下落相場（75日線の下で、75日線も下向き）は、短期で反発していても買い時にしない
+    # 8. 中長期の下落相場（75日線の下で、75日線も下向き）は、短期で反発していても買い時にしない
     if r.Close < r.MA75 and r.MA75 < ma75_20ago:
         score = min(score, BUY_THRESHOLD - 1)
         warnings.insert(0, "中長期の下落トレンド中（75日線の下で75日線も下向き）。短期の反発は戻り売りに注意。買い時にはしない")
@@ -267,7 +357,7 @@ def evaluate(df: pd.DataFrame, i: int = -1) -> Result:
         verdict = "様子見（条件が揃うのを待つ）"
     else:
         verdict = "見送り"
-    return Result(score, verdict, bd, reasons, warnings, entry, stop, target)
+    return Result(score, verdict, bd, reasons, warnings, entry, stop, target, sup, adj)
 
 
 def score_history(df: pd.DataFrame, days: int = 250) -> pd.Series:

@@ -1,0 +1,36 @@
+# JPXの銘柄別信用取引残高（毎営業日公表のPDF）を読み取り、data/margin_history.csv を更新する。
+# 更新がGitHubに入ると、Streamlit Cloud のアプリも自動で新しいデータを使う。
+name: 信用残の更新
+
+on:
+  schedule:
+    # 平日の 9:30 と 18:30（日本時間）。公表時刻が前後しても取りこぼさないよう2回
+    - cron: "30 0 * * 1-5"
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch: # GitHubの画面から手動でも実行できる
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas pypdf
+      - run: python margin.py
+      - name: 変更があればコミット
+        run: |
+          if git diff --quiet -- data/; then
+            echo "変更なし"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/margin_history.csv
+          git commit -m "信用残を更新（$(date -u +%Y-%m-%d)）"
+          git push

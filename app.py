@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import importlib
 import json
+import math
 import unicodedata
 from pathlib import Path
 
@@ -104,6 +105,26 @@ def load_usdjpy() -> float | None:
         return None
 
 
+MARGIN_FILE = Path(__file__).with_name("data") / "margin_history.csv"
+# GitHub Actions が毎日更新する。更新されたら読み直し、おすすめの採点もやり直す
+MARGIN_VERSION = str(MARGIN_FILE.stat().st_mtime) if MARGIN_FILE.exists() else ""
+
+
+@st.cache_data(show_spinner=False)
+def margin_table(version: str) -> dict[str, pd.DataFrame]:
+    """銘柄コード → 信用残の履歴（日付, 売残, 買残）。"""
+    if not MARGIN_FILE.exists():
+        return {}
+    df = pd.read_csv(MARGIN_FILE, dtype={"コード": str})
+    return {code: g.drop(columns="コード").reset_index(drop=True) for code, g in df.groupby("コード")}
+
+
+def margin_for(ticker: str) -> pd.DataFrame | None:
+    if not ticker.endswith(".T"):
+        return None
+    return margin_table(MARGIN_VERSION).get(ticker.removesuffix(".T"))
+
+
 def is_intraday(last_date) -> bool:
     """最新データが東証の取引時間中（未確定）の値かどうか。"""
     now = pd.Timestamp.now(tz="Asia/Tokyo")
@@ -125,8 +146,60 @@ def verdict_color(score: int) -> str:
     return "#dc2626"
 
 
+def render_supply(ticker: str, df: pd.DataFrame, res: logic.Result) -> None:
+    """需給（信用残・価格帯別出来高）の欄。"""
+    st.markdown("##### 📊 需給")
+    sup = res.supply
+    if sup is None:
+        msg = "米国株は信用残のデータがありません。" if not ticker.endswith(".T") else "この銘柄の信用残のデータがありません。"
+        st.caption(msg + "価格帯別出来高だけ表示します。")
+    else:
+        c1, c2 = st.columns(2)
+        chg = f"{sup.buy_chg:+.1f}%（{sup.chg_days}日前比）" if pd.notna(sup.buy_chg) else None
+        c1.metric("信用買い残", f"{sup.buy:,} 株", chg, delta_color="inverse",
+                  help="信用取引で買われたまま決済されていない株数。いずれ売られるので将来の売り圧力になる")
+        c2.metric("信用売り残", f"{sup.sell:,} 株",
+                  help="信用取引で売られたまま決済されていない株数。いずれ買い戻されるので将来の買い圧力になる")
+        c3, c4 = st.columns(2)
+        c3.metric("信用倍率", "—" if math.isinf(sup.ratio) else f"{sup.ratio:.2f} 倍",
+                  help="買い残÷売り残。高いほど買いに偏っていて上値が重くなりやすい。1倍未満は売り残の方が多い")
+        c4.metric("買い残は出来高の", f"{sup.buy_days:.1f} 日分",
+                  help="買い残÷1日の平均出来高（20日）。多いほど、売りが出たときに吸収するのに時間がかかる")
+        adj = f"　判定への反映 {res.supply_adj:+d}点" if res.supply_adj else "　判定への反映なし"
+        st.caption(f"信用残は {sup.date} 時点（日本取引所グループの公表データ）。{adj}")
+
+    prof = logic.volume_profile(df)
+    close = float(df["Close"].iloc[-1])
+    mid = (prof["下限"] + prof["上限"]) / 2
+    colors = ["#f97316" if close < m <= close * 1.10 else "#94a3b8" for m in mid]
+    fig = go.Figure(go.Bar(x=prof["出来高"], y=mid, orientation="h", marker_color=colors,
+                           width=(prof["上限"] - prof["下限"]) * 0.9,
+                           hovertemplate="%{y:,.0f}円付近<br>出来高 %{x:,.0f}<extra></extra>"))
+    fig.add_hline(y=close, line_color="#dc2626", annotation_text=f"現在値 {close:,.0f}")
+    fig.update_layout(title=dict(text="価格帯別出来高（直近半年）", font=dict(size=14)), height=360,
+                      margin=dict(l=4, r=4, t=40, b=4), dragmode=False, separators=".,",
+                      xaxis=dict(showticklabels=False), yaxis=dict(tickformat=",.0f"))
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    st.caption("オレンジは現在値〜+10%の価格帯。ここの出来高が多いと、買って含み損になっている人の戻り売り（しこり）が出やすい。")
+
+    hist = margin_for(ticker)
+    if hist is not None and len(hist) >= 2:
+        h = hist.sort_values("日付")
+        fig2 = go.Figure([
+            go.Scatter(x=h["日付"], y=h["買残"], name="信用買い残", line=dict(color="#dc2626"),
+                       hovertemplate="買い残 %{y:,.0f}株<extra></extra>"),
+            go.Scatter(x=h["日付"], y=h["売残"], name="信用売り残", line=dict(color="#2563eb"),
+                       hovertemplate="売り残 %{y:,.0f}株<extra></extra>"),
+        ])
+        fig2.update_layout(title=dict(text="信用残の推移", font=dict(size=14)), height=260, dragmode=False,
+                           margin=dict(l=4, r=4, t=40, b=4), legend=dict(orientation="h", y=1.15),
+                           separators=".,", hovermode="x unified", yaxis=dict(tickformat=",.0f"))
+        fig2.update_xaxes(type="category")
+        st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
+
+
 def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> None:
-    res = logic.evaluate(df)
+    res = logic.evaluate(df, margin=margin_for(ticker))
     color = verdict_color(res.score)
     st.markdown(
         f"<div style='padding:14px;border-radius:12px;border:2px solid {color};margin-bottom:12px'>"
@@ -160,6 +233,9 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
     st.markdown("##### 採点の内訳")
     for name, (s, full) in res.breakdown.items():
         st.progress(s / full, text=f"{name}　{s} / {full}")
+    st.caption("このほか、損切り幅・損益比・需給（信用残など）・中長期の下落トレンドで加点や減点をしています。")
+
+    render_supply(ticker, df, res)
 
     st.markdown("##### ✅ 買い材料")
     for r in res.reasons or ["なし"]:
@@ -233,7 +309,9 @@ def resolve(text: str) -> str:
 def result_row(ticker: str, res: logic.Result, df: pd.DataFrame) -> dict:
     return {"銘柄": label(ticker), "判定": res.verdict.split("（")[0], "スコア": res.score,
             "配当(%)": logic.dividend_yield(df), "終値": res.entry, "損切り": res.stop, "目標": res.target,
-            "損益比": (res.target - res.entry) / (res.entry - res.stop), "_ticker": ticker}
+            "損益比": (res.target - res.entry) / (res.entry - res.stop),
+            "信用倍率": res.supply.ratio if res.supply and math.isfinite(res.supply.ratio) else math.nan,
+            "買残(日)": res.supply.buy_days if res.supply else math.nan, "_ticker": ticker}
 
 
 def show_table(table: pd.DataFrame) -> None:
@@ -246,12 +324,14 @@ def show_table(table: pd.DataFrame) -> None:
             "損切り": st.column_config.NumberColumn(format="%.1f"),
             "目標": st.column_config.NumberColumn(format="%.1f"),
             "損益比": st.column_config.NumberColumn("損益比", format="%.1f", help="損失1に対する利益の見込み（リスクリワード）。1.5以上が目安"),
+            "信用倍率": st.column_config.NumberColumn("信用倍率", format="%.1f", help="信用買い残÷信用売り残"),
+            "買残(日)": st.column_config.NumberColumn("買残(日)", format="%.1f", help="信用買い残が平均出来高の何日分か"),
         },
     )
 
 
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
-def _scan(universe: str, logic_version: str) -> tuple[pd.DataFrame, str]:
+def _scan(universe: str, logic_version: str, margin_version: str) -> tuple[pd.DataFrame, str]:
     """対象銘柄をすべて採点する。重いので3時間キャッシュ（全利用者で共有）。"""
     tickers = logic.load_universe(universe)
     if load_market().empty:
@@ -260,14 +340,15 @@ def _scan(universe: str, logic_version: str) -> tuple[pd.DataFrame, str]:
     # 取得できた銘柄が8割未満なら一時的な失敗とみなしてキャッシュしない
     if len(data) < len(tickers) * 0.8:
         raise FetchError(f"{len(data)}/{len(tickers)}銘柄しか取得できず")
-    rows = [result_row(t, logic.evaluate(prepare(df)), df) for t, df in data.items() if len(df) >= 100]
+    rows = [result_row(t, logic.evaluate(prepare(df), margin=margin_for(t)), df)
+            for t, df in data.items() if len(df) >= 100]
     as_of = max(df.index[-1] for df in data.values()).strftime("%Y-%m-%d")
     return pd.DataFrame(rows), as_of
 
 
 def scan(universe: str) -> tuple[pd.DataFrame, str]:
     try:
-        return _scan(universe, LOGIC_VERSION)
+        return _scan(universe, LOGIC_VERSION, MARGIN_VERSION)
     except Exception:
         return pd.DataFrame(), ""
 
@@ -417,7 +498,7 @@ def bulk_tab() -> None:
         if df is None or len(df) < 100:
             continue
         prepared[t] = prepare(df)
-        rows.append(result_row(t, logic.evaluate(prepared[t]), prepared[t]))
+        rows.append(result_row(t, logic.evaluate(prepared[t], margin=margin_for(t)), prepared[t]))
 
     missing = [t for t in tickers if t not in prepared]
     if missing:
