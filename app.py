@@ -149,6 +149,17 @@ def verdict_color(score: int) -> str:
 
 
 SUPPLY_GUIDE = """
+**需給の天気の見方**
+| マーク | 天気 | 意味 |
+|---|---|---|
+| ☀️ | 晴れ | 需給良好。売り長（買い戻しが入りやすい）か、良い点が2つ以上ある |
+| 🌤️ | 晴れ時々くもり | 需給やや良好。減点はなく、良い点が1つある |
+| ☁️ | くもり | 需給ふつう。良い点も悪い点も目立たない |
+| 🌦️ | 小雨 | 需給やや悪い。判定で5点減点 |
+| ☔ | 雨 | 需給悪い。判定で10点以上減点 |
+
+良い点（それぞれ大型〜中型株の上位およそ20%に入る水準）：買い残が出来高の0.12日分未満／買い残が5営業日で20%以上減った／現在値のすぐ上（+10%まで）の出来高が半年分の5%以下
+
 **需給とは**
 株価は「買いたい人」と「売りたい人」のバランスで動きます。業績が良くても、これから売りたい人が多ければ株価は上がりにくくなります。この「これから出てくる売り・買い」の量を見るのが需給です。
 
@@ -204,9 +215,45 @@ def render_supply_guide() -> None:
         st.markdown(SUPPLY_GUIDE)
 
 
+WEATHER_COLORS = ["#f59e0b", "#84cc16", "#94a3b8", "#60a5fa", "#2563eb"]  # 晴れ（橙）〜雨（青）
+
+
+def weather_label(level: int | None) -> str:
+    """表に入れる短い表示（例: '☀️ 良好'）。"""
+    if level is None:
+        return ""
+    icon, _, word = logic.WEATHERS[level]
+    return f"{icon} {word.removeprefix('需給')}"
+
+
+def render_weather(level: int) -> None:
+    """需給の天気を大きなマークと5段階の目盛りで表示する。"""
+    icon, name, word = logic.WEATHERS[level]
+    color = WEATHER_COLORS[level]
+    # 目盛りは左が雨、右が晴れ。今の天気だけ大きく濃く表示する
+    scale = "".join(
+        f"<span style='font-size:{30 if i == level else 20}px;opacity:{1 if i == level else .3};margin:0 6px'>{w[0]}</span>"
+        for i, w in reversed(list(enumerate(logic.WEATHERS)))
+    )
+    st.markdown(
+        f"<div style='display:flex;align-items:center;gap:14px;padding:12px 16px;border-radius:12px;"
+        f"border:2px solid {color};background:{color}14;margin-bottom:8px'>"
+        f"<div style='font-size:56px;line-height:1'>{icon}</div>"
+        f"<div><div style='font-size:13px;opacity:.7'>需給の天気</div>"
+        f"<div style='font-size:24px;font-weight:700;color:{color}'>{name}</div>"
+        f"<div style='font-size:15px'>{word}</div></div></div>"
+        f"<div style='text-align:center;margin-bottom:4px'>{scale}</div>"
+        f"<div style='display:flex;justify-content:space-between;font-size:11px;opacity:.6;margin:0 8px 12px'>"
+        f"<span>悪い</span><span>良い</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_supply(ticker: str, df: pd.DataFrame, res: logic.Result) -> None:
     """需給（信用残・価格帯別出来高）の欄。"""
     st.markdown("##### 📊 需給")
+    if res.weather is not None:
+        render_weather(res.weather)
     sup = res.supply
     if sup is None:
         msg = "米国株は信用残のデータがありません。" if not ticker.endswith(".T") else "この銘柄の信用残のデータがありません。"
@@ -270,7 +317,9 @@ def render_detail(ticker: str, df: pd.DataFrame, show_signals: bool = True) -> N
         f"<div style='font-size:13px;opacity:.7'>{label(ticker)}　{df.index[-1]:%Y-%m-%d} 終値 {res.entry:,.1f}"
         f"　配当利回り {logic.dividend_yield(df):.2f}%（実績）</div>"
         f"<div style='font-size:26px;font-weight:700;color:{color}'>{res.verdict}</div>"
-        f"<div style='font-size:18px'>スコア {res.score} / 100</div></div>",
+        f"<div style='font-size:18px'>スコア {res.score} / 100"
+        + (f"　<span style='font-size:15px'>需給 {logic.WEATHERS[res.weather][0]} {logic.WEATHERS[res.weather][1]}</span>"
+           if res.weather is not None else "") + "</div></div>",
         unsafe_allow_html=True,
     )
     if res.squeeze:
@@ -375,7 +424,7 @@ def resolve(text: str) -> str:
 
 def result_row(ticker: str, res: logic.Result, df: pd.DataFrame) -> dict:
     return {"銘柄": label(ticker), "判定": res.verdict.split("（")[0], "スコア": res.score,
-            "配当(%)": logic.dividend_yield(df), "終値": res.entry, "損切り": res.stop, "目標": res.target,
+            "需給": weather_label(res.weather), "配当(%)": logic.dividend_yield(df), "終値": res.entry, "損切り": res.stop, "目標": res.target,
             "損益比": (res.target - res.entry) / (res.entry - res.stop),
             "信用倍率": res.supply.ratio if res.supply and math.isfinite(res.supply.ratio) else math.nan,
             "買残(日)": res.supply.buy_days if res.supply else math.nan,
@@ -411,7 +460,7 @@ def squeeze_list(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def show_squeeze_table(sq: pd.DataFrame) -> None:
-    view = sq[["銘柄", "お知らせ", "判定", "スコア", "信用倍率", "_売残日数"]].rename(columns={"_売残日数": "売残(日)"})
+    view = sq[["銘柄", "お知らせ", "需給", "判定", "スコア", "信用倍率", "_売残日数"]].rename(columns={"_売残日数": "売残(日)"})
     st.dataframe(view, hide_index=True, width="stretch", column_config={
         "スコア": st.column_config.ProgressColumn("スコア", min_value=0, max_value=100, format="%d"),
         "信用倍率": st.column_config.NumberColumn(format="%.2f", help="信用買い残÷信用売り残。1倍未満は売り残の方が多い"),

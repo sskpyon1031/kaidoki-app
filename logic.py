@@ -258,6 +258,42 @@ def supply_adjust(sup: Supply, price_chg5: float) -> tuple[int, list[str], list[
     return adj, reasons, warnings
 
 
+# 需給の天気（良い順）。(マーク, 天気, 需給の言葉)
+WEATHERS = [
+    ("☀️", "晴れ", "需給良好"),
+    ("🌤️", "晴れ時々くもり", "需給やや良好"),
+    ("☁️", "くもり", "需給ふつう"),
+    ("🌦️", "小雨", "需給やや悪い"),
+    ("☔", "雨", "需給悪い"),
+]
+
+
+# 需給の「良い点」のしきい値。TOPIX500 で上位およそ20%に入る水準（2026/11/5時点の分布）
+GOOD_BUY_DAYS = 0.12   # 買い残が出来高の0.12日分未満（少ない）
+GOOD_BUY_CHG = -20     # 買い残が5営業日で20%以上減った
+GOOD_OVERHEAD = 5      # 現在値〜+10%の出来高が半年分の5%以下（上値が軽い）
+
+
+def supply_weather(sup: Supply | None, overhead: float, adj: int) -> int:
+    """需給を5段階の天気にする。WEATHERS の番号（0=晴れ〜4=雨）を返す。
+
+    判定への加点・減点（adj）を基本に、減点はないが良い点がある銘柄を「晴れ時々くもり」や「晴れ」にする。
+    """
+    if sup is None:  # 信用残がないとき（米国株など）は上値のしこりだけで判断する
+        adj = -5 if overhead >= 65 else 0
+    if adj > 0:
+        return 0
+    if adj <= -10:
+        return 4
+    if adj < 0:
+        return 3
+    good = overhead <= GOOD_OVERHEAD
+    if sup is not None:
+        good += sup.buy_days < GOOD_BUY_DAYS
+        good += pd.notna(sup.buy_chg) and sup.buy_chg <= GOOD_BUY_CHG
+    return 0 if good >= 2 else 1 if good == 1 else 2
+
+
 def supply_comment(sup: Supply | None, overhead: float, adj: int) -> tuple[str, list[str]]:
     """需給の数字を、初心者にもわかる文章にまとめる。（見出し, 説明の行）を返す。
 
@@ -267,10 +303,10 @@ def supply_comment(sup: Supply | None, overhead: float, adj: int) -> tuple[str, 
     if sup is not None:
         if sup.buy_days >= 0.9:
             lines.append(f"信用買い残が出来高の{sup.buy_days:.1f}日分と多めです。いずれ売られる株が多く、上値が重くなりやすい状態です。")
-        elif sup.buy_days >= 0.3:
-            lines.append(f"信用買い残は出来高の{sup.buy_days:.1f}日分で、ふつうの水準です。")
+        elif sup.buy_days >= GOOD_BUY_DAYS:
+            lines.append(f"信用買い残は出来高の{sup.buy_days:.2f}日分で、ふつうの水準です。")
         else:
-            lines.append(f"信用買い残は出来高の{sup.buy_days:.1f}日分と少なく、将来の売り圧力は軽い状態です。")
+            lines.append(f"信用買い残は出来高の{sup.buy_days:.2f}日分と少なく、将来の売り圧力は軽い状態です。")
 
         if math.isinf(sup.ratio):
             lines.append("信用売り残がないため、信用倍率は計算できません。")
@@ -286,26 +322,20 @@ def supply_comment(sup: Supply | None, overhead: float, adj: int) -> tuple[str, 
         if pd.notna(sup.buy_chg):
             if sup.buy_chg >= 10:
                 lines.append(f"信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%増えました。下がったところを信用で買う人が増えていて、さらに下がると投げ売りが出やすくなります。")
-            elif sup.buy_chg <= -5:
-                lines.append(f"信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%減りました。決済が進み、売り圧力が軽くなっています。")
+            elif sup.buy_chg <= GOOD_BUY_CHG:
+                lines.append(f"信用買い残が{sup.chg_days}日で{sup.buy_chg:+.0f}%と大きく減りました。決済が進み、売り圧力が軽くなっています。")
             else:
                 lines.append(f"信用買い残は{sup.chg_days}日で{sup.buy_chg:+.0f}%と、大きな変化はありません。")
 
     if overhead >= 65:
         lines.append(f"現在値のすぐ上（+10%まで）で、直近半年の出来高の{overhead:.0f}%が売買されています。そこで買って含み損の人が多く、株価が戻ると「やれやれ売り」が出やすい価格帯です。")
-    elif overhead <= 20:
-        lines.append(f"現在値のすぐ上（+10%まで）で売買された量は半年分の{overhead:.0f}%と少なく、上値は軽い状態です。")
+    elif overhead <= GOOD_OVERHEAD:
+        lines.append(f"現在値のすぐ上（+10%まで）で売買された量は半年分の{overhead:.0f}%とほとんどなく、上値は軽い状態です。")
     else:
         lines.append(f"現在値のすぐ上（+10%まで）で売買された量は半年分の{overhead:.0f}%で、ふつうの水準です。")
 
-    if sup is None:  # 信用残がないときは上値のしこりだけで判断する
-        adj = -5 if overhead >= 65 else 0
-    if adj > 0:
-        head = "需給は良好です"
-    elif adj < 0:
-        head = "需給に注意が必要です"
-    else:
-        head = "需給に大きな問題はありません"
+    head = {0: "需給は良好です", 1: "需給はやや良好です", 2: "需給に大きな問題はありません",
+            3: "需給はやや悪く、注意が必要です", 4: "需給が悪く、注意が必要です"}[supply_weather(sup, overhead, adj)]
     return head, lines
 
 
@@ -322,6 +352,7 @@ class Result:
     supply: Supply | None = None
     supply_adj: int = 0  # 需給による加点・減点
     squeeze: tuple[str, str] | None = None  # 売り残が多く反発しやすいときのお知らせ（区分, 説明文）
+    weather: int | None = None  # 需給の天気（WEATHERS の番号）。過去の日付の判定では None
 
 
 def evaluate(df: pd.DataFrame, i: int = -1, margin: pd.DataFrame | None = None) -> Result:
@@ -457,7 +488,8 @@ def evaluate(df: pd.DataFrame, i: int = -1, margin: pd.DataFrame | None = None) 
     else:
         verdict = "見送り"
     squeeze = short_squeeze(sup, df.iloc[: len(df) + i + 1]) if sup is not None else None
-    return Result(score, verdict, bd, reasons, warnings, entry, stop, target, sup, adj, squeeze)
+    weather = supply_weather(sup, overhead_ratio(df), adj) if i == -1 else None
+    return Result(score, verdict, bd, reasons, warnings, entry, stop, target, sup, adj, squeeze, weather)
 
 
 def score_history(df: pd.DataFrame, days: int = 250) -> pd.Series:
